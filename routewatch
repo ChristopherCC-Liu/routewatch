@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""RouteWatch: local, read-only model routing and token-usage monitor."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import datetime as dt
+import glob
+import json
+import os
+import sqlite3
+import sys
+import threading
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+HOME = Path.home()
+DEFAULT_CODEX = HOME / ".codex" / "sessions"
+DEFAULT_CLAUDE = HOME / ".claude" / "projects"
+DEFAULT_HERMES_DB = HOME / ".hermes" / "state.db"
+DEFAULT_HERMES_STATE = HOME / ".hermes" / "gateway_state.json"
+
+
+@dataclass(frozen=True)
+class UsageEvent:
+    source: str
+    model: str
+    backend: str
+    timestamp: float
+    calls: int
+    prompt: int
+    output: int
+    cache: int
+    file_path: str = ""
+
+
+def as_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def parse_timestamp(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        # Codex timestamps are ISO strings; tolerate epoch values from adapters.
+        return float(value) if value > 100_000_000 else None
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return parsed.timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
+def compact(number: int | float) -> str:
+    n = float(number)
+    if abs(n) >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f}B"
+    if abs(n) >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if abs(n) >= 10_000:
+        return f"{n / 1_000:.0f}k"
+    if abs(n) >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return f"{int(n):,}"
+
+
+def short_age(timestamp: float | None, now: float | None = None) -> str:
+    if not timestamp:
+        return "no records"
+    seconds = max(0, int((now or time.time()) - timestamp))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def local_midnight(day: dt.date) -> float:
+    return dt.datetime.combine(day, dt.time.min).astimezone().timestamp()
+
+
+def format_model(value: Any) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else "unknown model"
+
+
+class FileUsageIndex:
+    """Incrementally read local JSONL usage records; never reads message bodies."""
+
+    def __init__(self, codex_root: Path, claude_root: Path, history_days: int):
+        self.codex_root = codex_root
+        self.claude_root = claude_root
+        self.history_days = history_days
+        self.events: dict[tuple[str, str], UsageEvent] = {}
+        self.file_state: dict[str, dict[str, Any]] = {}
+        self.file_keys: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        self.file_counts = {"Codex": 0, "Claude Code": 0}
+        self.latest = {"Codex": None, "Claude Code": None}
+        self.errors = {"Codex": "", "Claude Code": ""}
+        self.last_list_refresh = 0.0
+        self.file_lists: dict[str, list[Path]] = {"Codex": [], "Claude Code": []}
+
+    def set_history_days(self, days: int) -> None:
+        if days > self.history_days:
+            self.history_days = days
+            self.last_list_refresh = 0
+
+    def _refresh_file_lists(self, now: float) -> None:
+        if now - self.last_list_refresh < 10:
+            return
+        cutoff = now - self.history_days * 86400
+        self.last_list_refresh = now
+        self.file_counts = {"Codex": 0, "Claude Code": 0}
+        for label, root in (("Codex", self.codex_root), ("Claude Code", self.claude_root)):
+            found: list[Path] = []
+            if root.is_dir():
+                try:
+                    found = [Path(p) for p in glob.iglob(str(root / "**" / "*.jsonl"), recursive=True)]
+                except OSError as exc:
+                    self.errors[label] = f"cannot list logs ({type(exc).__name__})"
+            selected: list[Path] = []
+            for path in found:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                # Active Codex files can live in an old date folder, so mtime also matters.
+                if stat.st_mtime >= cutoff:
+                    selected.append(path)
+                elif label == "Codex":
+                    parts = path.parts
+                    try:
+                        i = parts.index("sessions")
+                        folder_day = dt.date(int(parts[i + 1]), int(parts[i + 2]), int(parts[i + 3]))
+                        if folder_day >= dt.datetime.fromtimestamp(cutoff).date():
+                            selected.append(path)
+                    except (ValueError, IndexError, TypeError):
+                        pass
+            self.file_lists[label] = selected
+
+    def _drop_file(self, path: str) -> None:
+        for key in self.file_keys.pop(path, set()):
+            self.events.pop(key, None)
+
+    def _add_event(self, path: str, key: tuple[str, str], event: UsageEvent, prefer_richer: bool = False) -> None:
+        old = self.events.get(key)
+        if old is None or not prefer_richer or (event.output, event.prompt, event.cache, event.timestamp) > (
+            old.output, old.prompt, old.cache, old.timestamp
+        ):
+            self.events[key] = event
+        self.file_keys[path].add(key)
+        previous = self.latest.get(event.source)
+        if previous is None or event.timestamp > previous:
+            self.latest[event.source] = event.timestamp
+
+    def _read_complete_lines(self, path: Path, label: str, parser: Any) -> None:
+        path_key = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        state = self.file_state.get(path_key)
+        if state is None or stat.st_size < state["offset"] or stat.st_ino != state["inode"] or (
+            stat.st_size == state["offset"] and stat.st_mtime_ns != state["mtime_ns"]
+        ):
+            self._drop_file(path_key)
+            state = {"offset": 0, "inode": stat.st_ino, "mtime_ns": stat.st_mtime_ns,
+                     "model": "unknown model", "provider": "", "modified": stat.st_mtime}
+            self.file_state[path_key] = state
+        if stat.st_size == state["offset"] and stat.st_mtime_ns == state["mtime_ns"]:
+            return
+        try:
+            with path.open("rb") as f:
+                f.seek(state["offset"])
+                data = f.read()
+        except OSError:
+            return
+        last_newline = data.rfind(b"\n")
+        if last_newline < 0:
+            return
+        complete = data[: last_newline + 1]
+        state["offset"] += len(complete)
+        state["mtime_ns"] = stat.st_mtime_ns
+        state["modified"] = stat.st_mtime
+        for raw in complete.splitlines():
+            if not raw:
+                continue
+            try:
+                record = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            try:
+                parser(record, path_key, state)
+            except (TypeError, ValueError, KeyError, AttributeError):
+                continue
+
+    def _parse_codex(self, obj: dict[str, Any], path: str, state: dict[str, Any]) -> None:
+        kind = obj.get("type")
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            return
+        if kind == "session_meta":
+            provider = payload.get("model_provider")
+            if isinstance(provider, str) and provider:
+                state["provider"] = provider
+        elif kind == "turn_context":
+            model = payload.get("model") or payload.get("model_name")
+            if isinstance(model, str) and model:
+                state["model"] = model
+            provider = payload.get("model_provider")
+            if isinstance(provider, str) and provider:
+                state["provider"] = provider
+        elif kind == "token_usage_record":
+            usage = payload.get("usage")
+            timestamp = parse_timestamp(obj.get("timestamp"))
+            if not isinstance(usage, dict) or not timestamp:
+                return
+            prompt = as_int(usage.get("input_tokens"))
+            output = as_int(usage.get("output_tokens"))
+            cache = as_int(usage.get("cached_input_tokens"))
+            if not (prompt or output or cache):
+                return
+            response_id = payload.get("response_id")
+            if not isinstance(response_id, str) or not response_id:
+                response_id = f"{timestamp:.6f}:{prompt}:{output}:{cache}"
+            provider = state.get("provider") or "Codex"
+            event = UsageEvent("Codex", format_model(state.get("model")), provider,
+                               timestamp, 1, prompt, output, cache, path)
+            self._add_event(path, ("Codex", response_id), event)
+
+    def _parse_claude(self, obj: dict[str, Any], path: str, _state: dict[str, Any]) -> None:
+        if obj.get("type") != "assistant":
+            return
+        message = obj.get("message")
+        if not isinstance(message, dict):
+            return
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            return
+        timestamp = parse_timestamp(obj.get("timestamp"))
+        if not timestamp:
+            return
+        raw_input = as_int(usage.get("input_tokens"))
+        cache_read = as_int(usage.get("cache_read_input_tokens"))
+        cache_write = as_int(usage.get("cache_creation_input_tokens"))
+        output = as_int(usage.get("output_tokens"))
+        prompt = raw_input + cache_read + cache_write
+        if not (prompt or output):
+            return
+        message_id = message.get("id") or obj.get("uuid")
+        if not isinstance(message_id, str) or not message_id:
+            message_id = f"{timestamp:.6f}:{prompt}:{output}"
+        event = UsageEvent("Claude Code", format_model(message.get("model")), "provider unknown",
+                           timestamp, 1, prompt, output, cache_read + cache_write, path)
+        # Claude writes an input-only usage row, then a completed row for the same message.
+        self._add_event(path, ("Claude Code", message_id), event, prefer_richer=True)
+
+    def update(self, now: float) -> None:
+        self._refresh_file_lists(now)
+        self.errors = {"Codex": "", "Claude Code": ""}
+        for source, parser in (("Codex", self._parse_codex), ("Claude Code", self._parse_claude)):
+            files = self.file_lists[source]
+            self.file_counts[source] = len(files)
+            if not (self.codex_root if source == "Codex" else self.claude_root).exists():
+                self.errors[source] = "log directory not found"
+                continue
+            for path in files:
+                self._read_complete_lines(path, source, parser)
+        cutoff = now - max(90, self.history_days) * 86400
+        expired = [key for key, event in self.events.items() if event.timestamp < cutoff]
+        for key in expired:
+            self.events.pop(key, None)
+            for keys in self.file_keys.values():
+                keys.discard(key)
+        self.latest = {"Codex": None, "Claude Code": None}
+        for event in self.events.values():
+            previous = self.latest[event.source]
+            if previous is None or event.timestamp > previous:
+                self.latest[event.source] = event.timestamp
+
+
+class HermesUsage:
+    def __init__(self, db_path: Path, gateway_path: Path):
+        self.db_path = db_path
+        self.gateway_path = gateway_path
+        self.rows: list[dict[str, Any]] = []
+        self.row_count = 0
+        self.latest: float | None = None
+        self.error = ""
+        self.gateway = "unknown"
+        self.gateway_age: float | None = None
+        self.active_agents = 0
+        self._baseline: dict[tuple[Any, ...], tuple[int, int, int, int]] | None = None
+        self.rate_events: deque[tuple[float, int, int]] = deque()
+
+    def _read_gateway_state(self, now: float) -> None:
+        self.gateway = "unknown"
+        self.gateway_age = None
+        self.active_agents = 0
+        try:
+            state = json.loads(self.gateway_path.read_text())
+            name = str(state.get("gateway_state", "unknown")).lower()
+            updated = parse_timestamp(state.get("updated_at"))
+            self.gateway_age = updated
+            active = state.get("active_agents", [])
+            self.active_agents = len(active) if isinstance(active, (list, dict)) else as_int(active)
+            pid = as_int(state.get("pid"))
+            alive = False
+            if pid:
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except OSError:
+                    alive = False
+            # Hermes writes this state at process start rather than as a heartbeat.
+            # Keep a live PID marked running for a day and expose the state age in the UI.
+            fresh = updated is not None and now - updated < 86400
+            if name == "running" and alive and fresh:
+                self.gateway = "running"
+            elif name == "running":
+                self.gateway = "stale"
+            else:
+                self.gateway = name
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+            self.gateway = "state unavailable"
+
+    def update(self, now: float) -> None:
+        self.error = ""
+        self._read_gateway_state(now)
+        if not self.db_path.is_file():
+            self.error = "state database not found"
+            self.rows = []
+            return
+        try:
+            db = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=0.5)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            rows = db.execute(
+                """SELECT m.session_id, m.model, m.billing_provider, m.billing_mode, m.task,
+                          m.api_call_count, m.input_tokens, m.output_tokens,
+                          m.cache_read_tokens, m.cache_write_tokens, m.last_seen
+                   FROM session_model_usage AS m"""
+            ).fetchall()
+            db.close()
+        except sqlite3.Error as exc:
+            self.error = f"state database read failed ({type(exc).__name__})"
+            return
+        clean: list[dict[str, Any]] = []
+        current: dict[tuple[Any, ...], tuple[int, int, int, int]] = {}
+        latest: float | None = None
+        for row in rows:
+            item = dict(row)
+            item["model"] = format_model(item.get("model"))
+            item["billing_provider"] = str(item.get("billing_provider") or "unknown provider")
+            item["billing_mode"] = str(item.get("billing_mode") or "")
+            item["task"] = str(item.get("task") or "")
+            for k in ("api_call_count", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+                item[k] = as_int(item.get(k))
+            item["last_seen"] = float(item.get("last_seen") or 0)
+            clean.append(item)
+            timestamp = item["last_seen"]
+            if timestamp and (latest is None or timestamp > latest):
+                latest = timestamp
+            key = (item.get("session_id"), item["model"], item["billing_provider"], item["billing_mode"], item["task"])
+            current[key] = (
+                item["input_tokens"] + item["cache_read_tokens"] + item["cache_write_tokens"],
+                item["output_tokens"], item["cache_read_tokens"] + item["cache_write_tokens"],
+                item["api_call_count"],
+            )
+        if self._baseline is not None:
+            for key, values in current.items():
+                previous = self._baseline.get(key, (0, 0, 0, 0))
+                dp, dout = values[0] - previous[0], values[1] - previous[1]
+                if dp > 0 or dout > 0:
+                    self.rate_events.append((now, max(0, dp), max(0, dout)))
+        self._baseline = current
+        while self.rate_events and now - self.rate_events[0][0] > 60:
+            self.rate_events.popleft()
+        self.rows = clean
+        self.row_count = len(clean)
+        self.latest = latest
+
+    def recent_rate(self, now: float, uptime: float) -> tuple[float, float]:
+        prompt = sum(item[1] for item in self.rate_events)
+        output = sum(item[2] for item in self.rate_events)
+        seconds = max(1.0, min(60.0, uptime))
+        return prompt / seconds, output / seconds
+
+
+class RouteWatch:
+    def __init__(self, args: argparse.Namespace):
+        self.days = args.days
+        self.index = FileUsageIndex(args.codex_dir, args.claude_dir, max(30, args.days))
+        self.hermes = HermesUsage(args.hermes_db, args.hermes_state)
+        self.refresh = max(1, args.refresh)
+        self.started = time.time()
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.first_pass_done = threading.Event()
+        self.last_scan = 0.0
+        self.worker = threading.Thread(target=self._background_update, name="routewatch-index", daemon=True)
+        self.worker.start()
+
+    def _background_update(self) -> None:
+        while not self.stop_event.is_set():
+            now = time.time()
+            with self.lock:
+                self.index.update(now)
+                self.hermes.update(now)
+                self.last_scan = now
+            self.first_pass_done.set()
+            self.stop_event.wait(self.refresh)
+
+    def set_days(self, days: int) -> None:
+        with self.lock:
+            self.days = days
+            self.index.set_history_days(max(30, days))
+
+    def snapshot(self, now: float | None = None) -> dict[str, Any]:
+        now = now or time.time()
+        today = dt.datetime.fromtimestamp(now).date()
+        start_day = today - dt.timedelta(days=self.days - 1)
+        start_ts = local_midnight(start_day)
+        previous_start = local_midnight(start_day - dt.timedelta(days=self.days))
+        with self.lock:
+            events = list(self.index.events.values())
+            hermes_rows = list(self.hermes.rows)
+            statuses = {
+                "Codex": {"files": self.index.file_counts["Codex"], "latest": self.index.latest["Codex"], "error": self.index.errors["Codex"]},
+                "Claude Code": {"files": self.index.file_counts["Claude Code"], "latest": self.index.latest["Claude Code"], "error": self.index.errors["Claude Code"]},
+                "Hermes": {"files": self.hermes.row_count, "latest": self.hermes.latest, "error": self.hermes.error},
+                "gateway": {"state": self.hermes.gateway, "latest": self.hermes.gateway_age, "agents": self.hermes.active_agents},
+            }
+            hermes_rate = self.hermes.recent_rate(now, now - self.started)
+
+        selected: list[UsageEvent] = [e for e in events if e.timestamp >= start_ts]
+        prev_records: list[UsageEvent] = [e for e in events if previous_start <= e.timestamp < start_ts]
+        for row in hermes_rows:
+            timestamp = row["last_seen"]
+            if timestamp >= start_ts:
+                provider = row["billing_provider"]
+                backend = provider + (f"/{row['billing_mode']}" if row["billing_mode"] else "")
+                if row["task"]:
+                    backend += f"/{row['task']}"
+                selected.append(UsageEvent(
+                    "Hermes", row["model"], backend, timestamp, row["api_call_count"],
+                    row["input_tokens"] + row["cache_read_tokens"] + row["cache_write_tokens"],
+                    row["output_tokens"], row["cache_read_tokens"] + row["cache_write_tokens"],
+                ))
+            elif previous_start <= timestamp < start_ts:
+                provider = row["billing_provider"]
+                backend = provider + (f"/{row['billing_mode']}" if row["billing_mode"] else "")
+                if row["task"]:
+                    backend += f"/{row['task']}"
+                prev_records.append(UsageEvent(
+                    "Hermes", row["model"], backend, timestamp, row["api_call_count"],
+                    row["input_tokens"] + row["cache_read_tokens"] + row["cache_write_tokens"],
+                    row["output_tokens"], row["cache_read_tokens"] + row["cache_write_tokens"],
+                ))
+
+        def totals(records: list[UsageEvent]) -> dict[str, int]:
+            return {"calls": sum(e.calls for e in records), "prompt": sum(e.prompt for e in records),
+                    "output": sum(e.output for e in records), "cache": sum(e.cache for e in records)}
+
+        current = totals(selected)
+        previous = totals(prev_records)
+        routes: dict[tuple[str, str, str], dict[str, Any]] = {}
+        source_totals: dict[str, dict[str, int]] = defaultdict(lambda: {"calls": 0, "prompt": 0, "output": 0, "cache": 0})
+        daily: dict[dt.date, dict[str, int]] = defaultdict(lambda: {"prompt": 0, "output": 0, "calls": 0})
+        latest_routes: dict[str, UsageEvent] = {}
+        for event in selected:
+            key = (event.source, event.model, event.backend)
+            route = routes.setdefault(key, {"source": event.source, "model": event.model, "backend": event.backend,
+                                            "calls": 0, "prompt": 0, "output": 0, "cache": 0, "latest": 0})
+            for field in ("calls", "prompt", "output", "cache"):
+                route[field] += getattr(event, field)
+                source_totals[event.source][field] += getattr(event, field)
+            route["latest"] = max(route["latest"], event.timestamp)
+            day = dt.datetime.fromtimestamp(event.timestamp).date()
+            if start_day <= day <= today:
+                daily[day]["prompt"] += event.prompt
+                daily[day]["output"] += event.output
+                daily[day]["calls"] += event.calls
+            old = latest_routes.get(event.source)
+            if old is None or event.timestamp > old.timestamp:
+                latest_routes[event.source] = event
+
+        route_list = sorted(routes.values(), key=lambda r: (r["prompt"] + r["output"], r["calls"]), reverse=True)
+        days = []
+        for offset in range(self.days):
+            day = start_day + dt.timedelta(days=offset)
+            days.append({"date": day, **daily[day]})
+
+        rate_by_source: dict[str, dict[str, float]] = defaultdict(lambda: {"prompt": 0.0, "output": 0.0})
+        for source in ("Codex", "Claude Code", "Hermes"):
+            rate_by_source[source]
+        for event in events:
+            if now - 60 <= event.timestamp <= now + 5:
+                rate_by_source[event.source]["prompt"] += event.prompt
+                rate_by_source[event.source]["output"] += event.output
+        rate_by_source["Hermes"]["prompt"] += hermes_rate[0] * 60
+        rate_by_source["Hermes"]["output"] += hermes_rate[1] * 60
+        rate = {"prompt": sum(v["prompt"] for v in rate_by_source.values()) / 60,
+                "output": sum(v["output"] for v in rate_by_source.values()) / 60,
+                "sources": {k: {"prompt_per_sec": v["prompt"] / 60, "output_per_sec": v["output"] / 60}
+                            for k, v in rate_by_source.items()}}
+        return {"now": now, "days": self.days, "start_day": start_day, "end_day": today,
+                "totals": current, "previous": previous, "routes": route_list,
+                "sources": dict(source_totals), "source_status": statuses,
+                "latest_routes": latest_routes, "daily": days, "rate": rate,
+                "indexing": not self.first_pass_done.is_set()}
+
+
+def pct_change(current: int, previous: int) -> str:
+    if previous <= 0:
+        return "new" if current > 0 else "flat"
+    change = (current - previous) / previous * 100
+    return f"{change:+.0f}%"
+
+
+def sparkline(values: list[int], width: int) -> str:
+    blocks = "▁▂▃▄▅▆▇█"
+    if width <= 0:
+        return ""
+    if not values:
+        return " " * width
+    if len(values) > width:
+        # Keep the maximum in each bucket so short spikes remain visible.
+        grouped = []
+        for i in range(width):
+            lo = int(i * len(values) / width)
+            hi = max(lo + 1, int((i + 1) * len(values) / width))
+            grouped.append(max(values[lo:hi] or [0]))
+        values = grouped
+    elif len(values) < width:
+        values = [0] * (width - len(values)) + values
+    maximum = max(values) if values else 0
+    if maximum <= 0:
+        return "·" * width
+    return "".join(blocks[min(7, int(v / maximum * 7))] for v in values)
+
+
+def trend_spark(values: list[int], width: int) -> str:
+    if len(values) <= width:
+        return sparkline(values, len(values))
+    return sparkline(values, width)
+
+
+def print_snapshot(app: RouteWatch) -> None:
+    app.first_pass_done.wait()
+    snap = app.snapshot()
+    totals = snap["totals"]
+    cache_pct = totals["cache"] / totals["prompt"] * 100 if totals["prompt"] else 0
+    print("ROUTEWATCH | GLOBAL MODEL ROUTING + TOKEN ANALYTICS")
+    print(f"Window: {snap['days']} days ({snap['start_day']} to {snap['end_day']}) | Updated: {dt.datetime.fromtimestamp(snap['now']).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    statuses = snap["source_status"]
+    for name in ("Codex", "Claude Code", "Hermes"):
+        item = statuses[name]
+        issue = f" — {item['error']}" if item.get("error") else ""
+        unit = "routes" if name == "Hermes" else "files"
+        print(f"{name:12} {item['files']:>5} {unit} | latest {short_age(item['latest'], snap['now'])}{issue}")
+    print(f"Hermes gateway: {statuses['gateway']['state']} | state {short_age(statuses['gateway']['latest'], snap['now'])} | active agents: {statuses['gateway']['agents']}")
+    print(f"Calls: {totals['calls']:,} | Prompt: {compact(totals['prompt'])} | Output: {compact(totals['output'])} | Cache: {compact(totals['cache'])} ({cache_pct:.0f}% of prompt)")
+    p = snap["previous"]
+    print(f"Compared with previous {snap['days']}d: prompt {pct_change(totals['prompt'], p['prompt'])}, output {pct_change(totals['output'], p['output'])}, calls {pct_change(totals['calls'], p['calls'])}")
+    rate = snap["rate"]
+    print(f"Recent recorded rate (last 60s): {(rate['prompt'] + rate['output']):.1f} tok/s total | prompt {rate['prompt']:.1f}/s, output {rate['output']:.1f}/s")
+    source_rate = " | ".join(f"{name} {(value['prompt_per_sec'] + value['output_per_sec']):.1f}/s"
+                             for name, value in sorted(rate["sources"].items()))
+    print(f"By source: {source_rate or 'no recent usage records'}")
+    print("Rate counts completed usage records; it is not live streaming TPS. Hermes rate starts after this monitor observes an update.")
+    print("\nROUTES (largest token volume first)")
+    print(f"{'SOURCE':12} {'MODEL':26} {'BACKEND / MODE':34} {'CALLS':>8} {'PROMPT':>10} {'OUTPUT':>9} {'CACHE':>9}")
+    for route in snap["routes"][:20]:
+        print(f"{route['source'][:12]:12} {route['model'][:26]:26} {route['backend'][:34]:34} {route['calls']:>8,} {compact(route['prompt']):>10} {compact(route['output']):>9} {compact(route['cache']):>9}")
+    print("\nDAILY TREND (Hermes session totals are assigned to last-activity day)")
+    for key in ("prompt", "output", "calls"):
+        vals = [day[key] for day in snap["daily"]]
+        print(f"{key.capitalize():8} {trend_spark(vals, 50)}  {compact(max(vals, default=0))} peak/day")
+    print("\nRun `routewatch` for the interactive terminal dashboard; `routewatch --help` for options.")
+
+
+def safe_add(stdscr: Any, y: int, x: int, text: str, attr: int = 0) -> None:
+    height, width = stdscr.getmaxyx()
+    if y < 0 or y >= height or x >= width:
+        return
+    clipped = text[: max(0, width - x - 1)]
+    try:
+        stdscr.addstr(y, x, clipped, attr)
+    except curses.error:
+        pass
+
+
+def draw_dashboard(stdscr: Any, app: RouteWatch) -> None:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    stdscr.nodelay(True)
+    stdscr.timeout(250)
+    bold = curses.A_BOLD
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        accent = curses.color_pair(1) | bold
+    except curses.error:
+        accent = bold
+    while not app.stop_event.is_set():
+        snap = app.snapshot()
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        now_text = dt.datetime.fromtimestamp(snap["now"]).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        safe_add(stdscr, 0, 0, f"ROUTEWATCH | MODELS + TOKENS | {now_text}", accent)
+        status = snap["source_status"]
+        parts = []
+        for name in ("Codex", "Claude Code"):
+            item = status[name]
+            if item.get("error"):
+                parts.append(f"{name}: {item['error']}")
+            else:
+                parts.append(f"{name}: {item['files']} {'files' if name != 'Hermes' else 'routes'}, latest {short_age(item['latest'], snap['now'])}")
+        safe_add(stdscr, 1, 0, "  |  ".join(parts))
+        hermes_status = status["Hermes"]
+        gateway = status["gateway"]
+        hermes_part = f"Hermes: {hermes_status['files']} routes, latest {short_age(hermes_status['latest'], snap['now'])}"
+        gateway_part = f"gw {gateway['state']} / {short_age(gateway['latest'], snap['now'])} / {gateway['agents']} agents"
+        parts = [hermes_part, gateway_part]
+        if snap["indexing"]:
+            parts.append("indexing recent logs")
+        safe_add(stdscr, 2, 0, "  |  ".join(parts))
+
+        totals = snap["totals"]
+        previous = snap["previous"]
+        cache_pct = totals["cache"] / totals["prompt"] * 100 if totals["prompt"] else 0
+        safe_add(stdscr, 4, 0, f"WINDOW {snap['days']}D | calls {compact(totals['calls'])} | prompt {compact(totals['prompt'])} | out {compact(totals['output'])} | cache {compact(totals['cache'])} ({cache_pct:.0f}%)", bold)
+        safe_add(stdscr, 5, 0, f"vs prior {snap['days']}d: prompt {pct_change(totals['prompt'], previous['prompt'])} | out {pct_change(totals['output'], previous['output'])} | calls {pct_change(totals['calls'], previous['calls'])}")
+        rate = snap["rate"]
+        safe_add(stdscr, 6, 0, f"RATE last 60s: {(rate['prompt'] + rate['output']):.1f} tok/s total | prompt {rate['prompt']:.1f}/s | output {rate['output']:.1f}/s", accent)
+        by_source = "   ".join(f"{name} {(value['prompt_per_sec'] + value['output_per_sec']):.1f}/s"
+                               for name, value in sorted(rate["sources"].items()))
+        safe_add(stdscr, 7, 2, f"By source: {by_source or 'no recent usage records'}")
+        safe_add(stdscr, 8, 2, "Completed-call records; live stream TPS is unavailable from these logs.")
+
+        daily = snap["daily"]
+        chart_width = max(8, min(56, w - 40))
+        safe_add(stdscr, 10, 0, f"DAILY TREND · {snap['start_day']} → {snap['end_day']} · Hermes by last activity day", bold)
+        for row, key, label in ((11, "prompt", "Prompt"), (12, "output", "Output"), (13, "calls", "Calls")):
+            values = [day[key] for day in daily]
+            safe_add(stdscr, row, 1, f"{label:7} {trend_spark(values, chart_width)}  peak {compact(max(values, default=0))}/day")
+
+        table_y = 14
+        safe_add(stdscr, table_y, 0, "OBSERVED ROUTES · source, model and backend recorded by each runtime", bold)
+        route_width = max(18, w - 44)
+        safe_add(stdscr, table_y + 1, 0, f"{'SOURCE':12} {'MODEL / BACKEND':{route_width}} {'CALLS':>7} {'PROMPT':>9} {'OUTPUT':>9}", accent)
+        max_rows = max(0, h - table_y - 4)
+        for i, route in enumerate(snap["routes"][: min(12, max_rows)]):
+            backend = route["backend"]
+            backend = backend.replace("/subscription_included", "/included")
+            backend = backend.replace("/background_review", "/review").replace("/title_generation", "/title")
+            label = f"{route['model']} · {backend}"
+            line = f"{route['source'][:12]:12} {label[:route_width]:{route_width}} {route['calls']:>7,} {compact(route['prompt']):>9} {compact(route['output']):>9}"
+            safe_add(stdscr, table_y + 2 + i, 0, line)
+        if not snap["routes"]:
+            safe_add(stdscr, table_y + 2, 1, "Waiting for usage records in the selected window…")
+        foot = "Keys: 1 = 1d   2 = 7d   3 = 30d   4 = 90d   r = refresh   q = quit"
+        safe_add(stdscr, h - 2, 0, foot, bold)
+        safe_add(stdscr, h - 1, 0, f"Local read-only sources · Codex / Claude / Hermes · refresh {app.refresh}s")
+        stdscr.refresh()
+        try:
+            key = stdscr.getch()
+        except curses.error:
+            key = -1
+        if key in (ord("q"), ord("Q")):
+            break
+        elif key == ord("1"):
+            app.set_days(1)
+        elif key == ord("2"):
+            app.set_days(7)
+        elif key == ord("3"):
+            app.set_days(30)
+        elif key == ord("4"):
+            app.set_days(90)
+        elif key in (ord("r"), ord("R")):
+            with app.lock:
+                app.index.last_list_refresh = 0
+        time.sleep(0.03)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="routewatch",
+        description="Read-only terminal monitor for local Codex, Claude Code, and Hermes routing/token telemetry.",
+        epilog="Rate is based on completed usage records; none of these local sources exposes live streamed TPS.",
+    )
+    parser.add_argument("--days", type=int, choices=(1, 7, 30, 90), default=30, help="trend window (default: 30)")
+    parser.add_argument("--refresh", type=int, default=3, help="dashboard refresh seconds (default: 3)")
+    parser.add_argument("--once", action="store_true", help="print one text snapshot and exit")
+    parser.add_argument("--codex-dir", type=Path, default=DEFAULT_CODEX, help=f"Codex sessions directory (default: {DEFAULT_CODEX})")
+    parser.add_argument("--claude-dir", type=Path, default=DEFAULT_CLAUDE, help=f"Claude Code projects directory (default: {DEFAULT_CLAUDE})")
+    parser.add_argument("--hermes-db", type=Path, default=DEFAULT_HERMES_DB, help=f"Hermes state database (default: {DEFAULT_HERMES_DB})")
+    parser.add_argument("--hermes-state", type=Path, default=DEFAULT_HERMES_STATE, help=f"Hermes gateway state JSON (default: {DEFAULT_HERMES_STATE})")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.refresh < 1:
+        print("routewatch: --refresh must be at least 1 second", file=sys.stderr)
+        return 2
+    app = RouteWatch(args)
+    try:
+        if args.once or not sys.stdout.isatty() or not sys.stdin.isatty():
+            print_snapshot(app)
+        else:
+            curses.wrapper(draw_dashboard, app)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        app.stop_event.set()
+        app.worker.join(timeout=2)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
