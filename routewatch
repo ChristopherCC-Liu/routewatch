@@ -24,6 +24,7 @@ DEFAULT_CODEX = HOME / ".codex" / "sessions"
 DEFAULT_CLAUDE = HOME / ".claude" / "projects"
 DEFAULT_HERMES_DB = HOME / ".hermes" / "state.db"
 DEFAULT_HERMES_STATE = HOME / ".hermes" / "gateway_state.json"
+DEFAULT_DEEPSEEK = HOME / ".dsh" / "storages" / "session_projcache" / "sessions"
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,10 @@ def as_int(value: Any) -> int:
 def parse_timestamp(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         # Codex timestamps are ISO strings; tolerate epoch values from adapters.
-        return float(value) if value > 100_000_000 else None
+        timestamp = float(value)
+        if timestamp > 100_000_000_000:
+            timestamp /= 1000
+        return timestamp if timestamp > 100_000_000 else None
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -398,11 +402,99 @@ class HermesUsage:
         return prompt / seconds, output / seconds
 
 
+class DeepSeekHarnessUsage:
+    """Read DSH's derived per-session metrics without opening conversation logs."""
+
+    def __init__(self, cache_dir: Path):
+        self.cache_dir = cache_dir
+        self.rows: list[dict[str, Any]] = []
+        self.file_count = 0
+        self.latest: float | None = None
+        self.error = ""
+        self._baseline: dict[tuple[str, str, str], tuple[int, int, int, int]] | None = None
+        self.rate_events: deque[tuple[float, int, int]] = deque()
+
+    def update(self, now: float) -> None:
+        self.error = ""
+        if not self.cache_dir.is_dir():
+            self.error = "session cache not found"
+            self.rows = []
+            self.file_count = 0
+            self.latest = None
+            return
+        try:
+            files = list(self.cache_dir.glob("session-*.json"))
+        except OSError as exc:
+            self.error = f"cannot list session cache ({type(exc).__name__})"
+            return
+        clean: list[dict[str, Any]] = []
+        current: dict[tuple[str, str, str], tuple[int, int, int, int]] = {}
+        latest: float | None = None
+        read_errors = 0
+        for path in files:
+            try:
+                stat = path.stat()
+                record = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                read_errors += 1
+                continue
+            rows = record.get("record", {}).get("rows", {})
+            if not isinstance(rows, dict):
+                continue
+            token_row = rows.get("tokenUsage", {})
+            totals = token_row.get("val", {}).get("totals", {}) if isinstance(token_row, dict) else {}
+            if not isinstance(totals, dict):
+                continue
+            uncached = as_int(totals.get("uncachedInputTokens"))
+            cache_read = as_int(totals.get("cacheReadTokens"))
+            cache_write = as_int(totals.get("cacheWriteTokens"))
+            output = as_int(totals.get("outputTokens"))
+            if not (uncached or cache_read or cache_write or output):
+                continue
+            model_row = rows.get("modelSelection", {})
+            last_used = model_row.get("val", {}).get("lastUsed", {}) if isinstance(model_row, dict) else {}
+            if not isinstance(last_used, dict):
+                last_used = {}
+            stats_row = rows.get("sessionStats", {})
+            stats = stats_row.get("val", {}) if isinstance(stats_row, dict) else {}
+            if not isinstance(stats, dict):
+                stats = {}
+            model = format_model(last_used.get("model"))
+            provider = str(last_used.get("provider") or "unknown provider")
+            effort = str(last_used.get("reasoningEffort") or "")
+            backend = provider + (f"/{effort}" if effort else "")
+            prompt = uncached + cache_read + cache_write
+            cache = cache_read + cache_write
+            timestamp = stat.st_mtime
+            item = {"session_id": path.stem, "model": model, "provider": provider,
+                    "backend": backend, "calls": as_int(stats.get("steps")),
+                    "prompt": prompt, "output": output, "cache": cache,
+                    "last_seen": timestamp}
+            clean.append(item)
+            latest = timestamp if latest is None else max(latest, timestamp)
+            current[(path.stem, model, backend)] = (prompt, output, cache, item["calls"])
+        if self._baseline is not None:
+            for key, values in current.items():
+                previous = self._baseline.get(key, (0, 0, 0, 0))
+                dp, dout = values[0] - previous[0], values[1] - previous[1]
+                if dp > 0 or dout > 0:
+                    self.rate_events.append((now, max(0, dp), max(0, dout)))
+        self._baseline = current
+        while self.rate_events and now - self.rate_events[0][0] > 60:
+            self.rate_events.popleft()
+        self.rows = clean
+        self.file_count = len(files)
+        self.latest = latest
+        if read_errors:
+            self.error = f"{read_errors} session cache file(s) unreadable"
+
+
 class RouteWatch:
     def __init__(self, args: argparse.Namespace):
         self.days = args.days
         self.index = FileUsageIndex(args.codex_dir, args.claude_dir, max(30, args.days * 2))
         self.hermes = HermesUsage(args.hermes_db, args.hermes_state)
+        self.deepseek = DeepSeekHarnessUsage(args.deepseek_dir)
         self.refresh = max(1, args.refresh)
         self.started = time.time()
         self.lock = threading.RLock()
@@ -413,9 +505,10 @@ class RouteWatch:
         self.collection_error = ""
         self.published = {
             "events": (), "hermes_rows": (), "hermes_rates": (),
+            "deepseek_rows": (), "deepseek_rates": (),
             "source_status": {
                 name: {"files": 0, "latest": None, "error": "indexing"}
-                for name in ("Codex", "Claude Code", "Hermes")
+                for name in ("Codex", "Claude Code", "Hermes", "DeepSeek Harness")
             },
         }
         self.published["source_status"]["gateway"] = {"state": "loading", "latest": None, "agents": 0}
@@ -432,15 +525,19 @@ class RouteWatch:
                 self.index.set_history_days(history_days)
                 self.index.update(now)
                 self.hermes.update(time.time())
+                self.deepseek.update(time.time())
                 published = {
                     "history_days": history_days,
                     "events": tuple(self.index.events.values()),
                     "hermes_rows": tuple(self.hermes.rows),
                     "hermes_rates": tuple(self.hermes.rate_events),
+                    "deepseek_rows": tuple(self.deepseek.rows),
+                    "deepseek_rates": tuple(self.deepseek.rate_events),
                     "source_status": {
                         "Codex": {"files": self.index.file_counts["Codex"], "latest": self.index.latest["Codex"], "error": self.index.errors["Codex"]},
                         "Claude Code": {"files": self.index.file_counts["Claude Code"], "latest": self.index.latest["Claude Code"], "error": self.index.errors["Claude Code"]},
                         "Hermes": {"files": self.hermes.row_count, "latest": self.hermes.latest, "error": self.hermes.error},
+                        "DeepSeek Harness": {"files": self.deepseek.file_count, "latest": self.deepseek.latest, "error": self.deepseek.error},
                         "gateway": {"state": self.hermes.gateway, "latest": self.hermes.gateway_age, "agents": self.hermes.active_agents},
                     },
                 }
@@ -475,11 +572,15 @@ class RouteWatch:
             collection_error = self.collection_error
         events = published["events"]
         hermes_rows = published["hermes_rows"]
+        deepseek_rows = published["deepseek_rows"]
         statuses = published["source_status"]
         live_deltas = [v for v in published["hermes_rates"] if now - 60 <= v[0] <= now]
         seconds = max(1.0, min(60.0, now - self.started))
         hermes_rate = (sum(v[1] for v in live_deltas) / seconds,
                        sum(v[2] for v in live_deltas) / seconds)
+        deepseek_deltas = [v for v in published["deepseek_rates"] if now - 60 <= v[0] <= now]
+        deepseek_rate = (sum(v[1] for v in deepseek_deltas) / seconds,
+                         sum(v[2] for v in deepseek_deltas) / seconds)
 
         selected: list[UsageEvent] = [e for e in events if start_ts <= e.timestamp <= now and (source == "All" or e.source == source)]
         prev_records: list[UsageEvent] = [e for e in events if previous_start <= e.timestamp < start_ts and (source == "All" or e.source == source)]
@@ -505,6 +606,16 @@ class RouteWatch:
                     row["input_tokens"] + row["cache_read_tokens"] + row["cache_write_tokens"],
                     row["output_tokens"], row["cache_read_tokens"] + row["cache_write_tokens"],
                 ))
+        for row in (deepseek_rows if source in ("All", "DeepSeek Harness") else ()):
+            timestamp = row["last_seen"]
+            event = UsageEvent(
+                "DeepSeek Harness", row["model"], row["backend"], timestamp, row["calls"],
+                row["prompt"], row["output"], row["cache"],
+            )
+            if start_ts <= timestamp <= now:
+                selected.append(event)
+            elif previous_start <= timestamp < start_ts:
+                prev_records.append(event)
 
         def totals(records: list[UsageEvent]) -> dict[str, int]:
             return {"calls": sum(e.calls for e in records), "prompt": sum(e.prompt for e in records),
@@ -545,7 +656,7 @@ class RouteWatch:
             days.append({"date": day, **daily[day]})
 
         rate_by_source: dict[str, dict[str, float]] = defaultdict(lambda: {"prompt": 0.0, "output": 0.0})
-        for source_name in ("Codex", "Claude Code", "Hermes"):
+        for source_name in ("Codex", "Claude Code", "Hermes", "DeepSeek Harness"):
             rate_by_source[source_name]
         for event in events:
             if now - 60 <= event.timestamp <= now + 5:
@@ -553,6 +664,8 @@ class RouteWatch:
                 rate_by_source[event.source]["output"] += event.output
         rate_by_source["Hermes"]["prompt"] += hermes_rate[0] * 60
         rate_by_source["Hermes"]["output"] += hermes_rate[1] * 60
+        rate_by_source["DeepSeek Harness"]["prompt"] += deepseek_rate[0] * 60
+        rate_by_source["DeepSeek Harness"]["output"] += deepseek_rate[1] * 60
         rate_values = [v for k, v in rate_by_source.items() if source == "All" or k == source]
         rate = {"prompt": sum(v["prompt"] for v in rate_values) / 60,
                 "output": sum(v["output"] for v in rate_values) / 60,
@@ -617,11 +730,11 @@ def print_snapshot(app: RouteWatch) -> None:
     print("ROUTEWATCH | GLOBAL MODEL ROUTING + TOKEN ANALYTICS")
     print(f"Window: {snap['days']} {'day' if snap['days'] == 1 else 'days'} ({snap['start_day']} to {snap['end_day']}) | Updated: {dt.datetime.fromtimestamp(snap['now']).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}")
     statuses = snap["source_status"]
-    for name in ("Codex", "Claude Code", "Hermes"):
+    for name in ("Codex", "Claude Code", "Hermes", "DeepSeek Harness"):
         item = statuses[name]
         issue = f" — {item['error']}" if item.get("error") else ""
-        unit = "routes" if name == "Hermes" else "files"
-        print(f"{name:12} {item['files']:>5} {unit} | latest {short_age(item['latest'], snap['now'])}{issue}")
+        unit = "usage rows" if name == "Hermes" else "sessions" if name == "DeepSeek Harness" else "files"
+        print(f"{name:16} {item['files']:>5} {unit} | latest {short_age(item['latest'], snap['now'])}{issue}")
     print(f"Hermes gateway: {statuses['gateway']['state']} | state {short_age(statuses['gateway']['latest'], snap['now'])} | active agents: {statuses['gateway']['agents']}")
     print(f"Calls: {totals['calls']:,} | Prompt: {compact(totals['prompt'])} | Output: {compact(totals['output'])} | Cache: {compact(totals['cache'])} ({cache_pct:.0f}% of prompt)")
     p = snap["previous"]
@@ -631,14 +744,14 @@ def print_snapshot(app: RouteWatch) -> None:
     source_rate = " | ".join(f"{name} {(value['prompt_per_sec'] + value['output_per_sec']):.1f}/s"
                              for name, value in sorted(rate["sources"].items()))
     print(f"By source: {source_rate or 'no recent usage records'}")
-    print("Rate counts completed usage records; it is not live streaming TPS. Hermes rate starts after this monitor observes an update.")
+    print("Rate counts completed usage records; it is not live streaming TPS. Hermes/DSH rates start after this monitor observes an update.")
     print("\nROUTES (largest token volume first)")
-    print(f"{'SOURCE':12} {'MODEL':26} {'BACKEND / MODE':34} {'CALLS':>8} {'PROMPT':>10} {'OUTPUT':>9} {'CACHE':>9}")
+    print(f"{'SOURCE':16} {'MODEL':26} {'BACKEND / MODE':34} {'CALLS':>8} {'PROMPT':>10} {'OUTPUT':>9} {'CACHE':>9}")
     for route in snap["routes"][:20]:
-        print(f"{route['source'][:12]:12} {route['model'][:26]:26} {route['backend'][:34]:34} {route['calls']:>8,} {compact(route['prompt']):>10} {compact(route['output']):>9} {compact(route['cache']):>9}")
+        print(f"{route['source'][:16]:16} {route['model'][:26]:26} {route['backend'][:34]:34} {route['calls']:>8,} {compact(route['prompt']):>10} {compact(route['output']):>9} {compact(route['cache']):>9}")
     unit = "hour" if snap["days"] == 1 else "day"
     heading = "HOURLY" if unit == "hour" else "DAILY"
-    print(f"\n{heading} TREND (Hermes session totals assigned to last activity)")
+    print(f"\n{heading} TREND (Hermes/DSH session totals assigned to last activity)")
     for key in ("prompt", "output", "calls"):
         vals = [bucket[key] for bucket in snap["timeline"]]
         print(f"{key.capitalize():8} {trend_spark(vals, 50)}  {compact(max(vals, default=0))} peak/{unit}")
@@ -659,7 +772,7 @@ def safe_add(stdscr: Any, y: int, x: int, text: str, attr: int = 0) -> None:
 
 class DashboardUI:
     VIEWS = ("Overview", "Routes", "Trends", "Sources")
-    SOURCES = ("All", "Codex", "Claude Code", "Hermes")
+    SOURCES = ("All", "Codex", "Claude Code", "Hermes", "DeepSeek Harness")
     SORTS = ("total", "output", "calls", "latest", "cache")
     METRICS = ("total", "prompt", "output", "cache", "calls")
 
@@ -847,14 +960,14 @@ class DashboardUI:
     def table(self, screen, snap, top, bottom):
         _, width = screen.getmaxyx()
         rows = self.route_rows(snap)
-        model_width = max(16, width - 52)
-        safe_add(screen, top, 2, f"{'SOURCE':11} {'MODEL':{model_width}} {'CALLS':>7} {'TOTAL':>9} {'OUTPUT':>8}", self.dim)
+        model_width = max(12, width - 57)
+        safe_add(screen, top, 2, f"{'SOURCE':16} {'MODEL':{model_width}} {'CALLS':>7} {'TOTAL':>9} {'OUTPUT':>8}", self.dim)
         count = max(1, bottom - top - 1)
         start = max(0, min(self.selected - count + 1, len(rows) - count))
         for offset, route in enumerate(rows[start:start + count]):
             index = start + offset
             y = top + 1 + offset
-            text = f"{route['source']:11} {route['model'][:model_width]:{model_width}} {compact(route['calls']):>7} {compact(route['prompt'] + route['output']):>9} {compact(route['output']):>8}"
+            text = f"{route['source'][:16]:16} {route['model'][:model_width]:{model_width}} {compact(route['calls']):>7} {compact(route['prompt'] + route['output']):>9} {compact(route['output']):>8}"
             selected = index == self.selected
             safe_add(screen, y, 1, (' ' + text).ljust(width - 3), curses.A_REVERSE if selected else 0)
             self.hits.append((y, 1, width - 3, "route", index))
@@ -925,7 +1038,7 @@ class DashboardUI:
         safe_add(screen, 7, 1, '─' * (width - 3), self.dim)
         if self.view == 0:
             safe_add(screen, 8, 2, 'SOURCE SHARE', self.accent)
-            bar_width = max(6, width - 56)
+            bar_width = max(6, width - 61)
             for i, name in enumerate(self.SOURCES[1:]):
                 metrics = snap['sources'].get(name, {})
                 amount = metrics.get('prompt', 0) + metrics.get('output', 0)
@@ -934,16 +1047,16 @@ class DashboardUI:
                 source_rate = rate.get('prompt_per_sec', 0) + rate.get('output_per_sec', 0)
                 bar = '█' * round(ratio * bar_width)
                 if self.source and name != self.SOURCES[self.source]:
-                    safe_add(screen, 9 + i, 2, f"{name:11} Outside filter - click to inspect", self.dim)
+                    safe_add(screen, 9 + i, 2, f"{name:16} Outside filter - click to inspect", self.dim)
                 else:
-                    safe_add(screen, 9 + i, 2, f"{name:11} {bar:<{bar_width}} {ratio:5.1%} {compact(amount):>8} {source_rate:>9,.1f}/s")
+                    safe_add(screen, 9 + i, 2, f"{name:16} {bar:<{bar_width}} {ratio:5.1%} {compact(amount):>8} {source_rate:>9,.1f}/s")
                 self.hits.append((9 + i, 2, width - 5, 'source_focus', i + 1))
             values = [v['total'] for v in snap['timeline']]
             unit = 'hourly today' if snap['days'] == 1 else 'daily'
-            safe_add(screen, 13, 2, f"{unit:12} {trend_spark(values, width - 31)}", self.accent)
-            self.hits.append((13, 2, width - 5, 'view', 2))
-            safe_add(screen, 14, 2, 'ROUTES  /  Enter for details', self.dim)
-            self.table(screen, snap, 15, height - 3)
+            safe_add(screen, 14, 2, f"{unit:12} {trend_spark(values, width - 31)}", self.accent)
+            self.hits.append((14, 2, width - 5, 'view', 2))
+            safe_add(screen, 15, 2, 'ROUTES  /  Enter for details', self.dim)
+            self.table(screen, snap, 16, height - 3)
         elif self.view == 1:
             count = len(self.route_rows(snap))
             self.button(screen, 8, 1, f's:sort {self.SORTS[self.sort]}', 'sort')
@@ -974,6 +1087,7 @@ class DashboardUI:
                      f"Mean tokens / call: {volume / route['calls']:,.0f}" if route['calls'] else 'Mean tokens / call: unavailable',
                      f"Last recorded: {dt.datetime.fromtimestamp(route['latest']).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
                      'Hermes values are session aggregates assigned to last activity.' if route['source'] == 'Hermes' else
+                     'DSH values are session aggregates assigned to cache-file activity.' if route['source'] == 'DeepSeek Harness' else
                      'Claude provider is not included in local usage records.' if route['source'] == 'Claude Code' else
                      'Model/provider come from Codex session context.',
                      'Esc / Enter: close']
@@ -988,7 +1102,7 @@ class DashboardUI:
                 'Space: freeze display (collection continues). r: refresh.',
                 'Esc: close overlay. ?: help. q: quit.', '',
                 '1d means today from local midnight, grouped hourly.',
-                'Hermes history uses session last-activity timestamps.',
+                'Hermes and DSH history use session last-activity timestamps.',
                 'Rates count recorded usage; they are not streamed TPS.',
                 'Mouse support depends on your terminal.'])
         screen.refresh()
@@ -1029,17 +1143,18 @@ class DashboardUI:
             safe_add(screen, bottom + 2, 9 + (len(visible) - 1) * 2, last_label, self.dim)
         item = timeline[selected]
         safe_add(screen, height - 5, 2, f"{item['label']} | {metric.upper()} {item[metric]:,} | calls {item['calls']:,}", self.accent)
-        safe_add(screen, height - 4, 2, f"Prompt {compact(item['prompt'])} / Out {compact(item['output'])} / Cache {compact(item['cache'])} | Hermes by last activity", self.dim)
+        safe_add(screen, height - 4, 2, f"Prompt {compact(item['prompt'])} / Out {compact(item['output'])} / Cache {compact(item['cache'])} | session totals by last activity", self.dim)
 
     def sources(self, screen, snap):
         height, width = screen.getmaxyx()
         for i, name in enumerate(self.SOURCES[1:]):
-            y = 8 + i * 4
+            y = 8 + i * 3
             item = snap['source_status'][name]
             state = item['error'] or 'Connected'
             self.button(screen, y, 1, name, 'source_focus', i + 1)
-            safe_add(screen, y, 19, state, self.good if not item['error'] else self.accent)
-            safe_add(screen, y + 1, 3, f"{item['files']:,} {'usage rows' if name == 'Hermes' else 'log files'} | latest usage {short_age(item['latest'], snap['now'])}")
+            safe_add(screen, y, 22, state, self.good if not item['error'] else self.accent)
+            unit = 'usage rows' if name == 'Hermes' else 'sessions' if name == 'DeepSeek Harness' else 'log files'
+            safe_add(screen, y + 1, 3, f"{item['files']:,} {unit} | latest usage {short_age(item['latest'], snap['now'])}")
             rate = snap['rate']['sources'].get(name, {})
             safe_add(screen, y + 2, 3, f"Recorded prompt {rate.get('prompt_per_sec', 0):,.1f}/s | output {rate.get('output_per_sec', 0):,.1f}/s", self.dim)
         if height >= 26:
@@ -1047,7 +1162,7 @@ class DashboardUI:
             safe_add(screen, 21, 2, f"Hermes gateway: {gw['state']} | state {short_age(gw['latest'], snap['now'])} | agents {gw['agents']}")
         if height >= 29:
             safe_add(screen, 23, 2, 'Local usage only. Claude transport provider is not recorded.', self.dim)
-            safe_add(screen, 24, 2, 'Hermes rate starts after an observed DB increment.', self.dim)
+            safe_add(screen, 24, 2, 'Hermes and DSH rates start after an observed aggregate increment.', self.dim)
 
 
 def draw_dashboard(stdscr: Any, app: RouteWatch) -> None:
@@ -1088,7 +1203,7 @@ def draw_dashboard(stdscr: Any, app: RouteWatch) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="routewatch",
-        description="Read-only terminal monitor for local Codex, Claude Code, and Hermes routing/token telemetry.",
+        description="Read-only terminal monitor for Codex, Claude Code, Hermes, and DeepSeek Harness routing/token telemetry.",
         epilog="Rate is based on completed usage records; none of these local sources exposes live streamed TPS.",
     )
     parser.add_argument("--days", type=int, choices=(1, 7, 30, 90), default=30, help="trend window (default: 30)")
@@ -1098,6 +1213,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--claude-dir", type=Path, default=DEFAULT_CLAUDE, help=f"Claude Code projects directory (default: {DEFAULT_CLAUDE})")
     parser.add_argument("--hermes-db", type=Path, default=DEFAULT_HERMES_DB, help=f"Hermes state database (default: {DEFAULT_HERMES_DB})")
     parser.add_argument("--hermes-state", type=Path, default=DEFAULT_HERMES_STATE, help=f"Hermes gateway state JSON (default: {DEFAULT_HERMES_STATE})")
+    parser.add_argument("--deepseek-dir", type=Path, default=DEFAULT_DEEPSEEK, help=f"DeepSeek Harness session cache directory (default: {DEFAULT_DEEPSEEK})")
     return parser.parse_args()
 
 

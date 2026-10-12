@@ -1,6 +1,6 @@
 # RouteWatch
 
-RouteWatch 是一个只读的终端面板，汇总本机 Codex、Claude Code 和 Hermes 的模型路由及 token 用量。它使用 Python 标准库，不需要安装 Python 第三方依赖，不连接网络，也不修改这些工具的配置。
+RouteWatch 是一个只读的终端面板，汇总本机 Codex、Claude Code、Hermes 和 DeepSeek Harness 的模型路由及 token 用量。它使用 Python 标准库，不需要安装 Python 第三方依赖，不连接网络，也不修改这些工具的配置。
 
 ## 安装
 
@@ -68,7 +68,7 @@ routewatch --help          # 查看所有参数
 |---|---|
 | 切换总览、路由、趋势、来源视图 | `Tab` / `Shift-Tab`，也可点击页签 |
 | 时间范围 | `1` 今天、`2` 7天、`3` 30天、`4` 90天 |
-| 来源筛选 | `f` 循环切换 All / Codex / Claude Code / Hermes |
+| 来源筛选 | `f` 循环切换 All / Codex / Claude Code / Hermes / DeepSeek Harness |
 | 路由列表导航 | `↑` / `↓` 或 `j` / `k`，`PgUp` / `PgDn`，`Home` / `End` |
 | 查看路由详情 | `Enter` 打开；`Esc` 或 `Enter` 关闭；鼠标双击也可打开 |
 | 搜索模型或 backend | 在路由页按 `/`，输入关键词后按 `Enter` |
@@ -78,17 +78,18 @@ routewatch --help          # 查看所有参数
 | 暂停 / 恢复显示 | 空格；采集在后台继续，切换来源或时间范围会恢复显示 |
 | 刷新 / 帮助 / 退出 | `r` / `?` / `q` |
 
-总览页展示 token 总量、调用次数、缓存占比、速率、来源占比和主要路由。来源占比行可点击进入该来源。路由详情显示模型、来源、backend/mode/task、调用数、各类 token 和最近记录时间。来源页展示三种采集源状态、日志/用量记录数、最新用量时间和来源速率。
+总览页展示 token 总量、调用次数、缓存占比、速率、来源占比和主要路由。来源占比行可点击进入该来源。路由详情显示模型、来源、backend/mode/task、调用数、各类 token 和最近记录时间。来源页展示四种采集源状态、日志/用量记录数、最新用量时间和来源速率。
 
 ## 数据来源和指标口径
 
 - **Codex：**读取 `~/.codex/sessions/**/*.jsonl` 的逐次用量事件，从会话上下文提取模型和 provider。
 - **Claude Code：**读取 `~/.claude/projects/**/*.jsonl` 中的 assistant 用量记录；流式输出可能重复写入同一消息，程序会合并并采用用量最完整的记录。日志没有传输 provider 字段，所以显示 `provider unknown`。
 - **Hermes：**只读 `~/.hermes/state.db` 中的模型用量汇总，并读取 `~/.hermes/gateway_state.json` 显示 gateway 状态。Hermes 按 session/model 保存累计用量，历史图表把该 session 的总量归在最后活跃日，这是近似口径。
+- **DeepSeek Harness：**读取 `~/.dsh/storages/session_projcache/sessions/*.json` 的派生 session 指标，包括模型、provider、reasoning effort、step 数和 token 分类。程序不解压或读取 Harness 对话日志。当前缓存只保留 session 累计量和最后使用的模型，因此历史图表把整个 session 归到缓存文件最后活动时间；若同一 session 中途切换模型，该 session 总量显示在最后使用的模型下。
 - 总量是 prompt 与输出之和。Prompt 包含各来源记录的缓存 token；缓存是 prompt 的子集，只用于单独展示，不会重复计入总量。
-- 面板的 `/s` 速率按最近一分钟内落盘的已完成用量记录估算。Codex 和 Claude Code 不把当前生成过程中的流式 token 暴露在本地日志中，因此它不是实时生成 TPS。Hermes 速率从 RouteWatch 启动并观测到数据库数值变化后才开始计算。
+- 面板的 `/s` 速率按最近一分钟内落盘的已完成用量记录估算。Codex 和 Claude Code 不把当前生成过程中的流式 token 暴露在本地日志中，因此它不是实时生成 TPS。Hermes 和 DeepSeek Harness 的速率从 RouteWatch 启动并观测到聚合数值变化后才开始计算。
 - 来源筛选同步应用于总览、路由和趋势；来源诊断页始终保留全部来源。搜索只过滤路由列表。
-- 如果某个工具使用自定义数据目录，可用 `--codex-dir`、`--claude-dir`、`--hermes-db`、`--hermes-state` 指定位置。
+- 如果某个工具使用自定义数据目录，可用 `--codex-dir`、`--claude-dir`、`--hermes-db`、`--hermes-state`、`--deepseek-dir` 指定位置。
 
 ## 故障排查
 
