@@ -9,7 +9,9 @@ import datetime as dt
 import glob
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -24,6 +26,7 @@ DEFAULT_CODEX = HOME / ".codex" / "sessions"
 DEFAULT_CLAUDE = HOME / ".claude" / "projects"
 DEFAULT_HERMES_DB = HOME / ".hermes" / "state.db"
 DEFAULT_HERMES_STATE = HOME / ".hermes" / "gateway_state.json"
+DEFAULT_DSH = HOME / ".dsh" / "sessions"
 
 
 @dataclass(frozen=True)
@@ -95,10 +98,6 @@ def format_model(value: Any) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else "unknown model"
 
 
-def is_deepseek(*values: Any) -> bool:
-    return any(isinstance(v, str) and "deepseek" in v.casefold() for v in values)
-
-
 class FileUsageIndex:
     """Incrementally read local JSONL usage records; never reads message bodies."""
 
@@ -109,9 +108,9 @@ class FileUsageIndex:
         self.events: dict[tuple[str, str], UsageEvent] = {}
         self.file_state: dict[str, dict[str, Any]] = {}
         self.file_keys: dict[str, set[tuple[str, str]]] = defaultdict(set)
-        self.file_counts = {"Codex": 0, "Claude Code": 0, "DeepSeek": 0}
-        self.latest = {"Codex": None, "Claude Code": None, "DeepSeek": None}
-        self.errors = {"Codex": "", "Claude Code": "", "DeepSeek": ""}
+        self.file_counts = {"Codex": 0, "Claude Code": 0}
+        self.latest = {"Codex": None, "Claude Code": None}
+        self.errors = {"Codex": "", "Claude Code": ""}
         self.last_list_refresh = 0.0
         self.file_lists: dict[str, list[Path]] = {"Codex": [], "Claude Code": []}
 
@@ -125,6 +124,7 @@ class FileUsageIndex:
             return
         cutoff = now - self.history_days * 86400
         self.last_list_refresh = now
+        self.file_counts = {"Codex": 0, "Claude Code": 0}
         for label, root in (("Codex", self.codex_root), ("Claude Code", self.claude_root)):
             found: list[Path] = []
             if root.is_dir():
@@ -238,13 +238,7 @@ class FileUsageIndex:
             if not isinstance(response_id, str) or not response_id:
                 response_id = f"{timestamp:.6f}:{prompt}:{output}:{cache}"
             provider = state.get("provider") or "Codex"
-            model = format_model(state.get("model"))
-            if is_deepseek(model, provider):
-                event = UsageEvent("DeepSeek", model, f"{provider} via Codex harness",
-                                   timestamp, 1, prompt, output, cache, path)
-                self._add_event(path, ("DeepSeek", response_id), event)
-                return
-            event = UsageEvent("Codex", model, provider,
+            event = UsageEvent("Codex", format_model(state.get("model")), provider,
                                timestamp, 1, prompt, output, cache, path)
             self._add_event(path, ("Codex", response_id), event)
 
@@ -270,18 +264,14 @@ class FileUsageIndex:
         message_id = message.get("id") or obj.get("uuid")
         if not isinstance(message_id, str) or not message_id:
             message_id = f"{timestamp:.6f}:{prompt}:{output}"
-        model = format_model(message.get("model"))
-        # Claude Code pointed at DeepSeek's Anthropic-compatible API logs the DeepSeek model name.
-        source, backend = (("DeepSeek", "Claude Code harness") if is_deepseek(model)
-                           else ("Claude Code", "provider unknown"))
-        event = UsageEvent(source, model, backend,
+        event = UsageEvent("Claude Code", format_model(message.get("model")), "provider unknown",
                            timestamp, 1, prompt, output, cache_read + cache_write, path)
         # Claude writes an input-only usage row, then a completed row for the same message.
-        self._add_event(path, (source, message_id), event, prefer_richer=True)
+        self._add_event(path, ("Claude Code", message_id), event, prefer_richer=True)
 
     def update(self, now: float) -> None:
         self._refresh_file_lists(now)
-        self.errors = {"Codex": "", "Claude Code": "", "DeepSeek": ""}
+        self.errors = {"Codex": "", "Claude Code": ""}
         for source, parser in (("Codex", self._parse_codex), ("Claude Code", self._parse_claude)):
             files = self.file_lists[source]
             self.file_counts[source] = len(files)
@@ -296,17 +286,259 @@ class FileUsageIndex:
             self.events.pop(key, None)
             for keys in self.file_keys.values():
                 keys.discard(key)
-        self.latest = {"Codex": None, "Claude Code": None, "DeepSeek": None}
-        deepseek_files: set[str] = set()
+        self.latest = {"Codex": None, "Claude Code": None}
         for event in self.events.values():
             previous = self.latest[event.source]
             if previous is None or event.timestamp > previous:
                 self.latest[event.source] = event.timestamp
-            if event.source == "DeepSeek":
-                deepseek_files.add(event.file_path)
-        self.file_counts["DeepSeek"] = len(deepseek_files)
-        if not deepseek_files:
-            self.errors["DeepSeek"] = "no DeepSeek-routed records yet"
+
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+ZSTD_BINARY_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/opt/anaconda3/bin")
+
+
+def zstd_complete_frames(buf: bytes) -> int:
+    """Return the offset just past the last complete zstd frame in buf (0 if there is none).
+
+    Only frame and block headers are walked, so a frame that is still being appended is left for
+    the next scan instead of being half decoded.
+    """
+    pos = end = 0
+    size = len(buf)
+    while pos + 4 <= size:
+        magic = int.from_bytes(buf[pos:pos + 4], "little")
+        if 0x184D2A50 <= magic <= 0x184D2A5F:  # skippable frame
+            if pos + 8 > size:
+                break
+            frame_end = pos + 8 + int.from_bytes(buf[pos + 4:pos + 8], "little")
+            if frame_end > size:
+                break
+            pos = end = frame_end
+            continue
+        if buf[pos:pos + 4] != ZSTD_MAGIC or pos + 5 > size:
+            break
+        descriptor = buf[pos + 4]
+        single_segment = (descriptor >> 5) & 1
+        cursor = pos + 5 + (0 if single_segment else 1) + (0, 1, 2, 4)[descriptor & 3]
+        cursor += (1 if single_segment else 0, 2, 4, 8)[descriptor >> 6]
+        while True:
+            if cursor + 3 > size:
+                return end
+            header = int.from_bytes(buf[cursor:cursor + 3], "little")
+            block_type, block_size = (header >> 1) & 3, header >> 3
+            if block_type == 3:  # reserved: not a frame we can trust
+                return end
+            cursor += 3 + (1 if block_type == 1 else block_size)
+            if cursor > size:
+                return end
+            if header & 1:
+                break
+        if descriptor & 4:  # content checksum
+            cursor += 4
+        if cursor > size:
+            return end
+        pos = end = cursor
+    return end
+
+
+class ZstdDecoder:
+    """Decode concatenated zstd frames: stdlib on Python 3.14+, otherwise a local zstd binary."""
+
+    def __init__(self) -> None:
+        self.module: Any = None
+        self.binary = ""
+        try:
+            from compression import zstd  # type: ignore[import-not-found]
+            self.module = zstd
+        except ImportError:
+            self.binary = shutil.which("zstd") or next(
+                (str(Path(d) / "zstd") for d in ZSTD_BINARY_DIRS if os.access(Path(d) / "zstd", os.X_OK)), "")
+
+    @property
+    def problem(self) -> str:
+        return "" if self.module is not None or self.binary else "zstd decoder not found (brew install zstd)"
+
+    def decode(self, data: bytes) -> bytes:
+        if self.module is not None:
+            try:
+                return self.module.decompress(data)
+            except Exception as exc:
+                raise ValueError(f"zstd decode failed ({type(exc).__name__})") from exc
+        try:
+            done = subprocess.run([self.binary, "-dc", "-q"], input=data, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(f"zstd decode failed ({type(exc).__name__})") from exc
+        if done.returncode != 0:
+            raise ValueError("zstd decode failed")
+        return done.stdout
+
+
+class DeepSeekHarnessUsage:
+    """Incrementally read DeepSeek Harness (dsh) sessions; message bodies are never kept.
+
+    A session is an append-only run of zstd frames holding JSONL events. Token usage sits on the
+    assistant/message events, one per model call, so only those lines are decoded into JSON.
+    """
+
+    SOURCE = "DeepSeek"
+
+    def __init__(self, root: Path, history_days: int):
+        self.root = root
+        self.history_days = history_days
+        self.decoder = ZstdDecoder()
+        self.events: dict[tuple[str, str], UsageEvent] = {}
+        self.file_state: dict[str, dict[str, Any]] = {}
+        self.file_keys: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        self.files: list[Path] = []
+        self.file_count = 0
+        self.latest: float | None = None
+        self.error = ""
+        self.list_error = ""
+        self.last_list_refresh = 0.0
+
+    def set_history_days(self, days: int) -> None:
+        if days > self.history_days:
+            self.history_days = days
+            self.last_list_refresh = 0
+
+    def _refresh_file_list(self, now: float) -> None:
+        if now - self.last_list_refresh < 10:
+            return
+        self.last_list_refresh = now
+        self.list_error = ""
+        cutoff = now - self.history_days * 86400
+        selected: list[Path] = []
+        try:
+            for found in glob.iglob(os.path.join(glob.escape(str(self.root)), "**", "session.v4.jsonl.zstd"),
+                                    recursive=True):
+                try:
+                    if os.stat(found).st_mtime >= cutoff:
+                        selected.append(Path(found))
+                except OSError:
+                    continue
+        except OSError as exc:
+            self.list_error = f"cannot list logs ({type(exc).__name__})"
+        self.files = selected
+
+    def _drop_file(self, path: str) -> None:
+        for key in self.file_keys.pop(path, set()):
+            self.events.pop(key, None)
+
+    @staticmethod
+    def _fresh_state(stat: os.stat_result) -> dict[str, Any]:
+        return {"offset": 0, "inode": stat.st_ino, "size": -1, "mtime_ns": 0, "head": b"", "partial": b"",
+                "model": "unknown model", "provider": ""}
+
+    def _read_file(self, path: Path) -> None:
+        path_key = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        state = self.file_state.get(path_key)
+        if state is None or stat.st_ino != state["inode"] or stat.st_size < state["offset"]:
+            self._drop_file(path_key)
+            state = self.file_state[path_key] = self._fresh_state(stat)
+        if stat.st_size == state["size"] and stat.st_mtime_ns == state["mtime_ns"]:
+            return
+        try:
+            with path.open("rb") as f:
+                head = f.read(32)
+                if state["offset"] and head[:len(state["head"])] != state["head"]:
+                    # Rewritten in place instead of appended to: index it again from the start.
+                    self._drop_file(path_key)
+                    state = self.file_state[path_key] = self._fresh_state(stat)
+                if len(head) > len(state["head"]):
+                    state["head"] = head
+                f.seek(state["offset"])
+                data = f.read()
+        except OSError:
+            return
+        state["size"], state["mtime_ns"] = stat.st_size, stat.st_mtime_ns
+        end = zstd_complete_frames(data)
+        if end == 0:
+            if len(data) >= 4 and not (data.startswith(ZSTD_MAGIC) or 0x184D2A50 <= int.from_bytes(data[:4], "little") <= 0x184D2A5F):
+                self.error = "unrecognized session log format"
+            return
+        try:
+            raw = self.decoder.decode(data[:end])
+        except ValueError as exc:
+            self.error = str(exc)
+            return
+        state["offset"] += end
+        buffered = state["partial"] + raw
+        cut = buffered.rfind(b"\n") + 1
+        state["partial"] = buffered[cut:]
+        session_id = path.parent.name
+        for line in buffered[:cut].splitlines():
+            if b"assistant/message" in line or b"model/selection" in line:
+                try:
+                    self._parse(json.loads(line), path_key, session_id, state)
+                except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError, KeyError, AttributeError):
+                    continue
+
+    def _parse(self, obj: dict[str, Any], path: str, session_id: str, state: dict[str, Any]) -> None:
+        kind = obj.get("type")
+        data = obj.get("data")
+        if not isinstance(data, dict):
+            return
+        if kind == "model/selection":
+            if isinstance(data.get("model"), str) and data["model"]:
+                state["model"] = data["model"]
+            if isinstance(data.get("provider"), str) and data["provider"]:
+                state["provider"] = data["provider"]
+            return
+        if kind != "assistant/message":
+            return
+        usage = data.get("usage")
+        message = data.get("message")
+        if not isinstance(usage, dict) or not isinstance(message, dict):
+            return
+        millis = obj.get("time")
+        if not isinstance(millis, (int, float)) or millis < 1e11:
+            return
+        timestamp = millis / 1000
+        cache = as_int(usage.get("cacheReadTokens")) + as_int(usage.get("cacheWriteTokens"))
+        # inputTokens excludes cache tokens here, so the prompt is input plus both cache counters.
+        prompt = as_int(usage.get("inputTokens")) + cache
+        output = as_int(usage.get("outputTokens"))
+        if not (prompt or output):
+            return
+        source = message.get("source")
+        source = source if isinstance(source, dict) else {}
+        model = format_model(source.get("model") or state.get("model"))
+        provider = source.get("provider") or state.get("provider") or "DeepSeek Harness"
+        message_id = message.get("id")
+        if not isinstance(message_id, str) or not message_id:
+            message_id = f"seq{obj.get('seq')}:{timestamp:.3f}"
+        key = (self.SOURCE, f"{session_id}:{message_id}")
+        self.events[key] = UsageEvent(self.SOURCE, model, str(provider), timestamp, 1, prompt, output, cache, path)
+        self.file_keys[path].add(key)
+
+    def update(self, now: float) -> None:
+        self.error = ""
+        if not self.root.is_dir():
+            self.error = "log directory not found"
+            self.files = []
+            self.file_count = 0
+        else:
+            self._refresh_file_list(now)
+            self.file_count = len(self.files)
+            if self.list_error:
+                self.error = self.list_error
+            elif self.files and self.decoder.problem:
+                self.error = self.decoder.problem
+            else:
+                for path in self.files:
+                    self._read_file(path)
+        cutoff = now - max(90, self.history_days) * 86400
+        expired = [key for key, event in self.events.items() if event.timestamp < cutoff]
+        for key in expired:
+            self.events.pop(key, None)
+            for keys in self.file_keys.values():
+                keys.discard(key)
+        self.latest = max((event.timestamp for event in self.events.values()), default=None)
 
 
 class HermesUsage:
@@ -421,6 +653,7 @@ class RouteWatch:
     def __init__(self, args: argparse.Namespace):
         self.days = args.days
         self.index = FileUsageIndex(args.codex_dir, args.claude_dir, max(30, args.days * 2))
+        self.dsh = DeepSeekHarnessUsage(args.dsh_dir, max(30, args.days * 2))
         self.hermes = HermesUsage(args.hermes_db, args.hermes_state)
         self.refresh = max(1, args.refresh)
         self.started = time.time()
@@ -450,16 +683,18 @@ class RouteWatch:
                 history_days = max(30, self.days * 2)
                 self.index.set_history_days(history_days)
                 self.index.update(now)
+                self.dsh.set_history_days(history_days)
+                self.dsh.update(time.time())
                 self.hermes.update(time.time())
                 published = {
                     "history_days": history_days,
-                    "events": tuple(self.index.events.values()),
+                    "events": tuple(self.index.events.values()) + tuple(self.dsh.events.values()),
                     "hermes_rows": tuple(self.hermes.rows),
                     "hermes_rates": tuple(self.hermes.rate_events),
                     "source_status": {
                         "Codex": {"files": self.index.file_counts["Codex"], "latest": self.index.latest["Codex"], "error": self.index.errors["Codex"]},
                         "Claude Code": {"files": self.index.file_counts["Claude Code"], "latest": self.index.latest["Claude Code"], "error": self.index.errors["Claude Code"]},
-                        "DeepSeek": {"files": self.index.file_counts["DeepSeek"], "latest": self.index.latest["DeepSeek"], "error": self.index.errors["DeepSeek"]},
+                        "DeepSeek": {"files": self.dsh.file_count, "latest": self.dsh.latest, "error": self.dsh.error},
                         "Hermes": {"files": self.hermes.row_count, "latest": self.hermes.latest, "error": self.hermes.error},
                         "gateway": {"state": self.hermes.gateway, "latest": self.hermes.gateway_age, "agents": self.hermes.active_agents},
                     },
@@ -481,6 +716,7 @@ class RouteWatch:
 
     def request_refresh(self) -> None:
         self.index.last_list_refresh = 0
+        self.dsh.last_list_refresh = 0
         self.wake_event.set()
 
     def snapshot(self, now: float | None = None, source: str = "All") -> dict[str, Any]:
@@ -995,7 +1231,7 @@ class DashboardUI:
                      f"Last recorded: {dt.datetime.fromtimestamp(route['latest']).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
                      'Hermes values are session aggregates assigned to last activity.' if route['source'] == 'Hermes' else
                      'Claude provider is not included in local usage records.' if route['source'] == 'Claude Code' else
-                     'Usage routed to DeepSeek models, detected by model name in Claude Code / Codex logs.' if route['source'] == 'DeepSeek' else
+                     'DeepSeek Harness (dsh): one usage record per model call, from its session logs.' if route['source'] == 'DeepSeek' else
                      'Model/provider come from Codex session context.',
                      'Esc / Enter: close']
             self.modal(screen, 'ROUTE DETAILS', lines)
@@ -1054,22 +1290,26 @@ class DashboardUI:
 
     def sources(self, screen, snap):
         height, width = screen.getmaxyx()
+        step = 4 if height >= 27 else 3
+        units = {'Hermes': 'usage rows', 'DeepSeek': 'session files'}
         for i, name in enumerate(self.SOURCES[1:]):
-            y = 8 + i * 4
+            y = 8 + i * step
             item = snap['source_status'][name]
             state = item['error'] or 'Connected'
             self.button(screen, y, 1, name, 'source_focus', i + 1)
             safe_add(screen, y, 19, state, self.good if not item['error'] else self.accent)
-            safe_add(screen, y + 1, 3, f"{item['files']:,} {'usage rows' if name == 'Hermes' else 'log files'} | latest usage {short_age(item['latest'], snap['now'])}")
+            safe_add(screen, y + 1, 3, f"{item['files']:,} {units.get(name, 'log files')} | latest usage {short_age(item['latest'], snap['now'])}")
             rate = snap['rate']['sources'].get(name, {})
             safe_add(screen, y + 2, 3, f"Recorded prompt {rate.get('prompt_per_sec', 0):,.1f}/s | output {rate.get('output_per_sec', 0):,.1f}/s", self.dim)
-        if height >= 30:
-            gw = snap['source_status']['gateway']
-            safe_add(screen, 25, 2, f"Hermes gateway: {gw['state']} | state {short_age(gw['latest'], snap['now'])} | agents {gw['agents']}")
-        if height >= 33:
-            safe_add(screen, 27, 2, 'Local usage only. Claude transport provider is not recorded.', self.dim)
-            safe_add(screen, 28, 2, 'DeepSeek = Claude Code / Codex usage whose model name contains "deepseek".', self.dim)
-            safe_add(screen, 29, 2, 'Hermes rate starts after an observed DB increment.', self.dim)
+        gw = snap['source_status']['gateway']
+        y = 8 + (len(self.SOURCES) - 1) * step
+        for text, attr in ((f"Hermes gateway: {gw['state']} | state {short_age(gw['latest'], snap['now'])} | agents {gw['agents']}", 0),
+                           ('Local usage only. Claude transport provider is not recorded.', self.dim),
+                           ('DeepSeek = DeepSeek Harness (dsh) sessions; failed attempts are not counted.', self.dim),
+                           ('Hermes rate starts after an observed DB increment.', self.dim)):
+            if y < height - 3:
+                safe_add(screen, y, 2, text, attr)
+            y += 1
 
 
 def draw_dashboard(stdscr: Any, app: RouteWatch) -> None:
@@ -1110,7 +1350,7 @@ def draw_dashboard(stdscr: Any, app: RouteWatch) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="routewatch",
-        description="Read-only terminal monitor for local Codex, Claude Code, DeepSeek-routed, and Hermes routing/token telemetry.",
+        description="Read-only terminal monitor for local Codex, Claude Code, DeepSeek Harness, and Hermes routing/token telemetry.",
         epilog="Rate is based on completed usage records; none of these local sources exposes live streamed TPS.",
     )
     parser.add_argument("--days", type=int, choices=(1, 7, 30, 90), default=30, help="trend window (default: 30)")
@@ -1118,6 +1358,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="print one text snapshot and exit")
     parser.add_argument("--codex-dir", type=Path, default=DEFAULT_CODEX, help=f"Codex sessions directory (default: {DEFAULT_CODEX})")
     parser.add_argument("--claude-dir", type=Path, default=DEFAULT_CLAUDE, help=f"Claude Code projects directory (default: {DEFAULT_CLAUDE})")
+    parser.add_argument("--dsh-dir", type=Path, default=DEFAULT_DSH, help=f"DeepSeek Harness sessions directory (default: {DEFAULT_DSH})")
     parser.add_argument("--hermes-db", type=Path, default=DEFAULT_HERMES_DB, help=f"Hermes state database (default: {DEFAULT_HERMES_DB})")
     parser.add_argument("--hermes-state", type=Path, default=DEFAULT_HERMES_STATE, help=f"Hermes gateway state JSON (default: {DEFAULT_HERMES_STATE})")
     return parser.parse_args()

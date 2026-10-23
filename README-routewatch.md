@@ -1,6 +1,6 @@
 # RouteWatch
 
-RouteWatch 是一个只读的终端面板，汇总本机 Codex、Claude Code、DeepSeek（harness）和 Hermes 的模型路由及 token 用量。它使用 Python 标准库，不需要安装 Python 第三方依赖，不连接网络，也不修改这些工具的配置。
+RouteWatch 是一个只读的终端面板，汇总本机 Codex、Claude Code、DeepSeek Harness（dsh）和 Hermes 的模型路由及 token 用量。它使用 Python 标准库，不需要安装 Python 第三方依赖，不连接网络，也不修改这些工具的配置。读取 DeepSeek Harness 的 zstd 压缩日志需要 Python 3.14+，或本机装有 `zstd` 命令（macOS：`brew install zstd`）。
 
 ## 安装
 
@@ -84,17 +84,18 @@ routewatch --help          # 查看所有参数
 
 - **Codex：**读取 `~/.codex/sessions/**/*.jsonl` 的逐次用量事件，从会话上下文提取模型和 provider。
 - **Claude Code：**读取 `~/.claude/projects/**/*.jsonl` 中的 assistant 用量记录；流式输出可能重复写入同一消息，程序会合并并采用用量最完整的记录。日志没有传输 provider 字段，所以显示 `provider unknown`。
-- **DeepSeek（harness）：**不是独立日志目录，而是按模型名识别：Claude Code（例如 `~/.claude/settings.deepseek.json` 把 `ANTHROPIC_BASE_URL` 指向 `api.deepseek.com/anthropic`）和 Codex 日志里，模型名或 provider 含 `deepseek` 的用量记录会归入 DeepSeek 来源，不再计入 Claude Code / Codex。路由页的 backend 列标明 `Claude Code harness` 或 `<provider> via Codex harness`。尚无此类记录时，来源页显示 `no DeepSeek-routed records yet`。
+- **DeepSeek（DeepSeek Harness）：**读取 `~/.dsh/sessions/**/session.v4.jsonl.zstd`。每个会话是只追加的 zstd 压缩 JSONL 事件流，程序只解析其中 `assistant/message` 事件的 `usage`（每次模型调用一条），不保留消息正文。`inputTokens` 不含缓存，所以 prompt = 输入 + 缓存读 + 缓存写；provider（如 `deepseek-account`）显示在 backend 列，子代理会话各自独立计入。标题生成、网页搜索等不带 usage 的请求，以及失败重试的尝试，不会被统计。
 - **Hermes：**只读 `~/.hermes/state.db` 中的模型用量汇总，并读取 `~/.hermes/gateway_state.json` 显示 gateway 状态。Hermes 按 session/model 保存累计用量，历史图表把该 session 的总量归在最后活跃日，这是近似口径。
 - 总量是 prompt 与输出之和。Prompt 包含各来源记录的缓存 token；缓存是 prompt 的子集，只用于单独展示，不会重复计入总量。
 - 面板的 `/s` 速率按最近一分钟内落盘的已完成用量记录估算。Codex 和 Claude Code 不把当前生成过程中的流式 token 暴露在本地日志中，因此它不是实时生成 TPS。Hermes 速率从 RouteWatch 启动并观测到数据库数值变化后才开始计算。
 - 来源筛选同步应用于总览、路由和趋势；来源诊断页始终保留全部来源。搜索只过滤路由列表。
-- 如果某个工具使用自定义数据目录，可用 `--codex-dir`、`--claude-dir`、`--hermes-db`、`--hermes-state` 指定位置。
+- 如果某个工具使用自定义数据目录，可用 `--codex-dir`、`--claude-dir`、`--dsh-dir`、`--hermes-db`、`--hermes-state` 指定位置。
 
 ## 故障排查
 
 - `routewatch: command not found`：确认安装目标 `~/.local/bin/routewatch` 存在，且 `~/.local/bin` 已在 `PATH` 中；运行 `echo "$PATH"` 检查，或直接使用 `./routewatch`。
 - 没有路由记录：确认对应工具在本机已有会话记录，检查来源页的连接状态，并确认传给参数的目录或数据库位置正确。
+- DeepSeek 来源显示 `zstd decoder not found`：安装 zstd 命令（`brew install zstd`），或改用 Python 3.14+ 运行。
 - `curses` 或终端错误：先用兼容的终端模拟器，确认 `TERM` 有设置；如果是通过管道或非交互 shell 运行，使用 `routewatch --once` 获取文本输出。
 - 数据较多时首轮历史索引可能需要一些时间；面板会先打开，索引完成后自动更新。
 
