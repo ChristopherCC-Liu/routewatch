@@ -95,6 +95,10 @@ def format_model(value: Any) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else "unknown model"
 
 
+def is_deepseek(*values: Any) -> bool:
+    return any(isinstance(v, str) and "deepseek" in v.casefold() for v in values)
+
+
 class FileUsageIndex:
     """Incrementally read local JSONL usage records; never reads message bodies."""
 
@@ -105,9 +109,9 @@ class FileUsageIndex:
         self.events: dict[tuple[str, str], UsageEvent] = {}
         self.file_state: dict[str, dict[str, Any]] = {}
         self.file_keys: dict[str, set[tuple[str, str]]] = defaultdict(set)
-        self.file_counts = {"Codex": 0, "Claude Code": 0}
-        self.latest = {"Codex": None, "Claude Code": None}
-        self.errors = {"Codex": "", "Claude Code": ""}
+        self.file_counts = {"Codex": 0, "Claude Code": 0, "DeepSeek": 0}
+        self.latest = {"Codex": None, "Claude Code": None, "DeepSeek": None}
+        self.errors = {"Codex": "", "Claude Code": "", "DeepSeek": ""}
         self.last_list_refresh = 0.0
         self.file_lists: dict[str, list[Path]] = {"Codex": [], "Claude Code": []}
 
@@ -121,7 +125,6 @@ class FileUsageIndex:
             return
         cutoff = now - self.history_days * 86400
         self.last_list_refresh = now
-        self.file_counts = {"Codex": 0, "Claude Code": 0}
         for label, root in (("Codex", self.codex_root), ("Claude Code", self.claude_root)):
             found: list[Path] = []
             if root.is_dir():
@@ -235,7 +238,13 @@ class FileUsageIndex:
             if not isinstance(response_id, str) or not response_id:
                 response_id = f"{timestamp:.6f}:{prompt}:{output}:{cache}"
             provider = state.get("provider") or "Codex"
-            event = UsageEvent("Codex", format_model(state.get("model")), provider,
+            model = format_model(state.get("model"))
+            if is_deepseek(model, provider):
+                event = UsageEvent("DeepSeek", model, f"{provider} via Codex harness",
+                                   timestamp, 1, prompt, output, cache, path)
+                self._add_event(path, ("DeepSeek", response_id), event)
+                return
+            event = UsageEvent("Codex", model, provider,
                                timestamp, 1, prompt, output, cache, path)
             self._add_event(path, ("Codex", response_id), event)
 
@@ -261,14 +270,18 @@ class FileUsageIndex:
         message_id = message.get("id") or obj.get("uuid")
         if not isinstance(message_id, str) or not message_id:
             message_id = f"{timestamp:.6f}:{prompt}:{output}"
-        event = UsageEvent("Claude Code", format_model(message.get("model")), "provider unknown",
+        model = format_model(message.get("model"))
+        # Claude Code pointed at DeepSeek's Anthropic-compatible API logs the DeepSeek model name.
+        source, backend = (("DeepSeek", "Claude Code harness") if is_deepseek(model)
+                           else ("Claude Code", "provider unknown"))
+        event = UsageEvent(source, model, backend,
                            timestamp, 1, prompt, output, cache_read + cache_write, path)
         # Claude writes an input-only usage row, then a completed row for the same message.
-        self._add_event(path, ("Claude Code", message_id), event, prefer_richer=True)
+        self._add_event(path, (source, message_id), event, prefer_richer=True)
 
     def update(self, now: float) -> None:
         self._refresh_file_lists(now)
-        self.errors = {"Codex": "", "Claude Code": ""}
+        self.errors = {"Codex": "", "Claude Code": "", "DeepSeek": ""}
         for source, parser in (("Codex", self._parse_codex), ("Claude Code", self._parse_claude)):
             files = self.file_lists[source]
             self.file_counts[source] = len(files)
@@ -283,11 +296,17 @@ class FileUsageIndex:
             self.events.pop(key, None)
             for keys in self.file_keys.values():
                 keys.discard(key)
-        self.latest = {"Codex": None, "Claude Code": None}
+        self.latest = {"Codex": None, "Claude Code": None, "DeepSeek": None}
+        deepseek_files: set[str] = set()
         for event in self.events.values():
             previous = self.latest[event.source]
             if previous is None or event.timestamp > previous:
                 self.latest[event.source] = event.timestamp
+            if event.source == "DeepSeek":
+                deepseek_files.add(event.file_path)
+        self.file_counts["DeepSeek"] = len(deepseek_files)
+        if not deepseek_files:
+            self.errors["DeepSeek"] = "no DeepSeek-routed records yet"
 
 
 class HermesUsage:
@@ -415,7 +434,7 @@ class RouteWatch:
             "events": (), "hermes_rows": (), "hermes_rates": (),
             "source_status": {
                 name: {"files": 0, "latest": None, "error": "indexing"}
-                for name in ("Codex", "Claude Code", "Hermes")
+                for name in ("Codex", "Claude Code", "DeepSeek", "Hermes")
             },
         }
         self.published["source_status"]["gateway"] = {"state": "loading", "latest": None, "agents": 0}
@@ -440,6 +459,7 @@ class RouteWatch:
                     "source_status": {
                         "Codex": {"files": self.index.file_counts["Codex"], "latest": self.index.latest["Codex"], "error": self.index.errors["Codex"]},
                         "Claude Code": {"files": self.index.file_counts["Claude Code"], "latest": self.index.latest["Claude Code"], "error": self.index.errors["Claude Code"]},
+                        "DeepSeek": {"files": self.index.file_counts["DeepSeek"], "latest": self.index.latest["DeepSeek"], "error": self.index.errors["DeepSeek"]},
                         "Hermes": {"files": self.hermes.row_count, "latest": self.hermes.latest, "error": self.hermes.error},
                         "gateway": {"state": self.hermes.gateway, "latest": self.hermes.gateway_age, "agents": self.hermes.active_agents},
                     },
@@ -545,7 +565,7 @@ class RouteWatch:
             days.append({"date": day, **daily[day]})
 
         rate_by_source: dict[str, dict[str, float]] = defaultdict(lambda: {"prompt": 0.0, "output": 0.0})
-        for source_name in ("Codex", "Claude Code", "Hermes"):
+        for source_name in ("Codex", "Claude Code", "DeepSeek", "Hermes"):
             rate_by_source[source_name]
         for event in events:
             if now - 60 <= event.timestamp <= now + 5:
@@ -617,7 +637,7 @@ def print_snapshot(app: RouteWatch) -> None:
     print("ROUTEWATCH | GLOBAL MODEL ROUTING + TOKEN ANALYTICS")
     print(f"Window: {snap['days']} {'day' if snap['days'] == 1 else 'days'} ({snap['start_day']} to {snap['end_day']}) | Updated: {dt.datetime.fromtimestamp(snap['now']).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}")
     statuses = snap["source_status"]
-    for name in ("Codex", "Claude Code", "Hermes"):
+    for name in ("Codex", "Claude Code", "DeepSeek", "Hermes"):
         item = statuses[name]
         issue = f" — {item['error']}" if item.get("error") else ""
         unit = "routes" if name == "Hermes" else "files"
@@ -659,7 +679,7 @@ def safe_add(stdscr: Any, y: int, x: int, text: str, attr: int = 0) -> None:
 
 class DashboardUI:
     VIEWS = ("Overview", "Routes", "Trends", "Sources")
-    SOURCES = ("All", "Codex", "Claude Code", "Hermes")
+    SOURCES = ("All", "Codex", "Claude Code", "DeepSeek", "Hermes")
     SORTS = ("total", "output", "calls", "latest", "cache")
     METRICS = ("total", "prompt", "output", "cache", "calls")
 
@@ -975,6 +995,7 @@ class DashboardUI:
                      f"Last recorded: {dt.datetime.fromtimestamp(route['latest']).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
                      'Hermes values are session aggregates assigned to last activity.' if route['source'] == 'Hermes' else
                      'Claude provider is not included in local usage records.' if route['source'] == 'Claude Code' else
+                     'Usage routed to DeepSeek models, detected by model name in Claude Code / Codex logs.' if route['source'] == 'DeepSeek' else
                      'Model/provider come from Codex session context.',
                      'Esc / Enter: close']
             self.modal(screen, 'ROUTE DETAILS', lines)
@@ -1042,12 +1063,13 @@ class DashboardUI:
             safe_add(screen, y + 1, 3, f"{item['files']:,} {'usage rows' if name == 'Hermes' else 'log files'} | latest usage {short_age(item['latest'], snap['now'])}")
             rate = snap['rate']['sources'].get(name, {})
             safe_add(screen, y + 2, 3, f"Recorded prompt {rate.get('prompt_per_sec', 0):,.1f}/s | output {rate.get('output_per_sec', 0):,.1f}/s", self.dim)
-        if height >= 26:
+        if height >= 30:
             gw = snap['source_status']['gateway']
-            safe_add(screen, 21, 2, f"Hermes gateway: {gw['state']} | state {short_age(gw['latest'], snap['now'])} | agents {gw['agents']}")
-        if height >= 29:
-            safe_add(screen, 23, 2, 'Local usage only. Claude transport provider is not recorded.', self.dim)
-            safe_add(screen, 24, 2, 'Hermes rate starts after an observed DB increment.', self.dim)
+            safe_add(screen, 25, 2, f"Hermes gateway: {gw['state']} | state {short_age(gw['latest'], snap['now'])} | agents {gw['agents']}")
+        if height >= 33:
+            safe_add(screen, 27, 2, 'Local usage only. Claude transport provider is not recorded.', self.dim)
+            safe_add(screen, 28, 2, 'DeepSeek = Claude Code / Codex usage whose model name contains "deepseek".', self.dim)
+            safe_add(screen, 29, 2, 'Hermes rate starts after an observed DB increment.', self.dim)
 
 
 def draw_dashboard(stdscr: Any, app: RouteWatch) -> None:
@@ -1088,7 +1110,7 @@ def draw_dashboard(stdscr: Any, app: RouteWatch) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="routewatch",
-        description="Read-only terminal monitor for local Codex, Claude Code, and Hermes routing/token telemetry.",
+        description="Read-only terminal monitor for local Codex, Claude Code, DeepSeek-routed, and Hermes routing/token telemetry.",
         epilog="Rate is based on completed usage records; none of these local sources exposes live streamed TPS.",
     )
     parser.add_argument("--days", type=int, choices=(1, 7, 30, 90), default=30, help="trend window (default: 30)")
