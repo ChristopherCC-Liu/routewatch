@@ -706,15 +706,15 @@ class AntigravityUsage:
                 effort = level
                 break
         if "argon" in lower:
-            return "gemini-4-argon", f"google/{effort}" if effort else "google"
+            return f"gemini-4-argon-{effort}" if effort else "gemini-4-argon", f"google/{effort}" if effort else "google"
         if "claude" in lower and "sonnet" in lower:
             slug = "claude-sonnet-5-5" if "5.5" in lower else "claude-sonnet-5"
-            return f"{slug}-{effort}" if effort else slug, "anthropic"
+            return f"{slug}-{effort}" if effort else slug, f"anthropic/{effort}" if effort else "anthropic"
         if "claude" in lower and "opus" in lower:
             slug = "claude-opus-5-5" if "5.5" in lower else "claude-opus-5"
-            return f"{slug}-{effort}" if effort else slug, "anthropic"
+            return f"{slug}-{effort}" if effort else slug, f"anthropic/{effort}" if effort else "anthropic"
         if "3.8" in lower and "flash" in lower:
-            return f"gemini-3.8-flash-{effort}" if effort else "gemini-3.8-flash", "google"
+            return f"gemini-3.8-flash-{effort}" if effort else "gemini-3.8-flash", f"google/{effort}" if effort else "google"
         slug = re.sub(r"[^a-z0-9.]+", "-", re.sub(r"\([^)]*\)", "", lower)).strip("-")
         provider = "anthropic" if "claude" in slug else "google"
         return format_model(slug), f"{provider}/{effort}" if effort else provider
@@ -770,11 +770,17 @@ class AntigravityUsage:
         self._drop_file(path_key)
         session_id = path.stem
         try:
-            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
-            db.execute("PRAGMA query_only=ON")
-            gen_rows = db.execute("SELECT idx, data FROM gen_metadata").fetchall()
-            step_rows = db.execute("SELECT idx, step_type, metadata FROM steps WHERE step_type IN (15, 23)").fetchall()
-            db.close()
+            try:
+                db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
+                db.execute("PRAGMA query_only=ON")
+                gen_rows = db.execute("SELECT idx, data FROM gen_metadata").fetchall()
+                step_rows = db.execute("SELECT idx, step_type, metadata FROM steps WHERE step_type IN (15, 23)").fetchall()
+                db.close()
+            except sqlite3.OperationalError:
+                db = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True, timeout=0.5)
+                gen_rows = db.execute("SELECT idx, data FROM gen_metadata").fetchall()
+                step_rows = db.execute("SELECT idx, step_type, metadata FROM steps WHERE step_type IN (15, 23)").fetchall()
+                db.close()
         except sqlite3.Error:
             self._read_transcript_fallback(tr_path, path_key, session_id)
             self.file_state[path_key] = sig
