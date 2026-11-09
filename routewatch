@@ -9,6 +9,7 @@ import datetime as dt
 import glob
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -27,6 +28,8 @@ DEFAULT_CLAUDE = HOME / ".claude" / "projects"
 DEFAULT_HERMES_DB = HOME / ".hermes" / "state.db"
 DEFAULT_HERMES_STATE = HOME / ".hermes" / "gateway_state.json"
 DEFAULT_DSH = HOME / ".dsh" / "sessions"
+DEFAULT_ANTIGRAVITY = HOME / ".gemini" / "antigravity"
+SOURCE_NAMES = ("Codex", "Claude Code", "DeepSeek", "Antigravity", "Hermes")
 
 
 @dataclass(frozen=True)
@@ -541,6 +544,331 @@ class DeepSeekHarnessUsage:
         self.latest = max((event.timestamp for event in self.events.values()), default=None)
 
 
+def _pb_varint(buf: bytes, pos: int, limit: int) -> tuple[int | None, int]:
+    value = shift = 0
+    while pos < limit:
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return value, pos
+        shift += 7
+        if shift > 70:
+            return None, pos
+    return None, pos
+
+
+def _pb_fields(buf: bytes):
+    pos, limit = 0, len(buf)
+    while pos < limit:
+        tag, pos = _pb_varint(buf, pos, limit)
+        if tag is None:
+            break
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            val, pos = _pb_varint(buf, pos, limit)
+            if val is None:
+                break
+            yield field, wire, val
+        elif wire == 2:
+            size, pos = _pb_varint(buf, pos, limit)
+            if size is None or pos + size > limit:
+                break
+            yield field, wire, buf[pos : pos + size]
+            pos += size
+        elif wire == 1:
+            if pos + 8 > limit:
+                break
+            pos += 8
+        elif wire == 5:
+            if pos + 4 > limit:
+                break
+            pos += 4
+        else:
+            break
+
+
+def _pb_timestamp(buf: bytes) -> float | None:
+    sec = nano = 0
+    for field, wire, val in _pb_fields(buf):
+        if wire == 0 and field == 1:
+            sec = val
+        elif wire == 0 and field == 2:
+            nano = val
+    return sec + nano / 1_000_000_000 if sec > 100_000_000 else None
+
+
+def _pb_usage(buf: bytes) -> dict[str, Any]:
+    info: dict[str, Any] = {}
+    for field, wire, val in _pb_fields(buf):
+        if wire == 0 and field in (1, 2, 3, 5):
+            info[str(field)] = val
+        elif wire == 2 and field == 7:
+            info["bot_id"] = val.decode("utf-8", errors="replace")
+    return info
+
+
+class AntigravityUsage:
+    """Incrementally read local Antigravity conversation SQLite DBs (with transcript fallback)."""
+
+    SOURCE = "Antigravity"
+    ENUM_MODELS = {
+        1319: "gemini-3.8-flash",
+        1322: "gemini-3.8-flash-tiered",
+        1401: "claude-opus-5-5-medium",
+        1402: "claude-opus-5-5-high",
+        1404: "claude-sonnet-5-5-medium",
+        1417: "gemini-4-argon",
+        1418: "gemini-4-argon",
+        1419: "gemini-4-argon",
+    }
+    ENUM_EFFORT = {
+        1417: "high",
+        1418: "medium",
+        1419: "low",
+    }
+    UI_MODEL_RE = re.compile(r"setting `Model Selection` from .+? to ([^\n.]+)")
+
+    def __init__(self, root: Path, history_days: int):
+        self.root = root
+        self.history_days = history_days
+        self.events: dict[tuple[str, str], UsageEvent] = {}
+        self.file_state: dict[str, tuple[Any, ...]] = {}
+        self.file_keys: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        self.files: list[Path] = []
+        self.file_count = 0
+        self.latest: float | None = None
+        self.error = ""
+        self.list_error = ""
+        self.last_list_refresh = 0.0
+
+    def _dirs(self) -> tuple[Path, Path]:
+        if self.root.name == "conversations":
+            return self.root, self.root.parent / "brain"
+        return self.root / "conversations", self.root / "brain"
+
+    def set_history_days(self, days: int) -> None:
+        if days > self.history_days:
+            self.history_days = days
+            self.last_list_refresh = 0
+
+    @staticmethod
+    def _stat_pair(path: Path) -> tuple[int, int, float]:
+        try:
+            st = path.stat()
+            return st.st_size, st.st_mtime_ns, st.st_mtime
+        except OSError:
+            return 0, 0, 0.0
+
+    def _refresh_file_list(self, now: float) -> None:
+        if now - self.last_list_refresh < 10:
+            return
+        self.last_list_refresh = now
+        self.list_error = ""
+        cutoff = now - self.history_days * 86400
+        conv_dir, brain_dir = self._dirs()
+        selected: list[Path] = []
+        try:
+            for found in glob.iglob(os.path.join(glob.escape(str(conv_dir)), "*.db")):
+                path = Path(found)
+                _, _, db_mtime = self._stat_pair(path)
+                _, _, wal_mtime = self._stat_pair(Path(found + "-wal"))
+                _, _, tr_mtime = self._stat_pair(brain_dir / path.stem / ".system_generated" / "logs" / "transcript.jsonl")
+                if max(db_mtime, wal_mtime, tr_mtime) >= cutoff:
+                    selected.append(path)
+        except OSError as exc:
+            self.list_error = f"cannot list logs ({type(exc).__name__})"
+        self.files = selected
+
+    def _drop_file(self, path: str) -> None:
+        for key in self.file_keys.pop(path, set()):
+            self.events.pop(key, None)
+
+    @classmethod
+    def _format_route(cls, model: str, model_enum: int | None) -> tuple[str, str]:
+        resolved = format_model(model or (cls.ENUM_MODELS.get(model_enum or 0, "")))
+        provider = "anthropic" if "claude" in resolved.lower() else "google"
+        effort = cls.ENUM_EFFORT.get(model_enum or 0, "")
+        if effort and not resolved.endswith(f"-{effort}"):
+            resolved = f"{resolved}-{effort}"
+        for suffix in ("high", "medium", "low", "max", "tiered"):
+            if resolved.endswith(f"-{suffix}"):
+                return resolved, f"{provider}/{suffix}"
+        return resolved, provider
+
+    @classmethod
+    def _parse_ui_selection(cls, label: str) -> tuple[str, str]:
+        raw = label.strip()
+        lower = raw.lower()
+        effort = ""
+        for level in ("high", "medium", "low", "max"):
+            if f"({level})" in lower:
+                effort = level
+                break
+        if "argon" in lower:
+            return "gemini-4-argon", f"google/{effort}" if effort else "google"
+        if "claude" in lower and "sonnet" in lower:
+            slug = "claude-sonnet-5-5" if "5.5" in lower else "claude-sonnet-5"
+            return f"{slug}-{effort}" if effort else slug, "anthropic"
+        if "claude" in lower and "opus" in lower:
+            slug = "claude-opus-5-5" if "5.5" in lower else "claude-opus-5"
+            return f"{slug}-{effort}" if effort else slug, "anthropic"
+        if "3.8" in lower and "flash" in lower:
+            return f"gemini-3.8-flash-{effort}" if effort else "gemini-3.8-flash", "google"
+        slug = re.sub(r"[^a-z0-9.]+", "-", re.sub(r"\([^)]*\)", "", lower)).strip("-")
+        provider = "anthropic" if "claude" in slug else "google"
+        return format_model(slug), f"{provider}/{effort}" if effort else provider
+
+    def _read_transcript_fallback(self, tr_path: Path, path_key: str, session_id: str) -> None:
+        if not tr_path.is_file():
+            return
+        model, backend = "unknown model", "google"
+        try:
+            with tr_path.open("rb") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return
+        for raw in lines:
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            content = obj.get("content")
+            if isinstance(content, str) and "Model Selection" in content:
+                matches = self.UI_MODEL_RE.findall(content)
+                if matches:
+                    model, backend = self._parse_ui_selection(matches[-1])
+            if obj.get("type") not in ("PLANNER_RESPONSE", "CHECKPOINT"):
+                continue
+            timestamp = parse_timestamp(obj.get("created_at"))
+            cache = as_int(obj.get("cache_read_tokens"))
+            prompt = as_int(obj.get("input_tokens")) + cache
+            output = as_int(obj.get("output_tokens"))
+            if not timestamp or not (prompt or output):
+                continue
+            step_idx = obj.get("step_index")
+            key = (self.SOURCE, f"{session_id}:tr:{step_idx}:{timestamp:.0f}")
+            self.events[key] = UsageEvent(self.SOURCE, model, backend, timestamp, 1, prompt, output, cache, path_key)
+            self.file_keys[path_key].add(key)
+
+    def _read_file(self, path: Path, brain_dir: Path) -> None:
+        path_key = str(path)
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        wal_size, wal_mtime_ns, _ = self._stat_pair(Path(path_key + "-wal"))
+        tr_path = brain_dir / path.stem / ".system_generated" / "logs" / "transcript.jsonl"
+        tr_size, tr_mtime_ns, _ = self._stat_pair(tr_path)
+        sig = (st.st_ino, st.st_size, st.st_mtime_ns, wal_size, wal_mtime_ns, tr_size, tr_mtime_ns)
+        if self.file_state.get(path_key) == sig:
+            return
+        self._drop_file(path_key)
+        session_id = path.stem
+        try:
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
+            db.execute("PRAGMA query_only=ON")
+            gen_rows = db.execute("SELECT idx, data FROM gen_metadata").fetchall()
+            step_rows = db.execute("SELECT idx, step_type, metadata FROM steps WHERE step_type IN (15, 23)").fetchall()
+            db.close()
+        except sqlite3.Error:
+            self._read_transcript_fallback(tr_path, path_key, session_id)
+            self.file_state[path_key] = sig
+            return
+
+        gen_by_bot: dict[str, tuple[str, int | None]] = {}
+        conv_models: dict[int, str] = {}
+        last_model: tuple[str, int | None] = ("", None)
+        for _idx, blob in gen_rows:
+            if not isinstance(blob, (bytes, memoryview)):
+                continue
+            for field, wire, val in _pb_fields(bytes(blob)):
+                if field != 1 or wire != 2:
+                    continue
+                model = ""
+                model_enum: int | None = None
+                bot_id = ""
+                for f2, w2, v2 in _pb_fields(val):
+                    if f2 == 3 and w2 == 0:
+                        model_enum = v2
+                    elif f2 == 4 and w2 == 2:
+                        bot_id = _pb_usage(v2).get("bot_id", "")
+                    elif f2 == 19 and w2 == 2:
+                        model = v2.decode("utf-8", errors="replace").strip()
+                if model_enum is not None and model:
+                    conv_models[model_enum] = model
+                if model or model_enum is not None:
+                    last_model = (model, model_enum)
+                if bot_id:
+                    gen_by_bot[bot_id] = (model, model_enum)
+
+        added = 0
+        for idx, _stype, meta in step_rows:
+            if not isinstance(meta, (bytes, memoryview)):
+                continue
+            t_created = t_done = None
+            usage: dict[str, Any] = {}
+            step_enum: int | None = None
+            for field, wire, val in _pb_fields(bytes(meta)):
+                if field == 1 and wire == 2:
+                    t_created = _pb_timestamp(val)
+                elif field in (7, 8) and wire == 2:
+                    t_done = _pb_timestamp(val) or t_done
+                elif field == 9 and wire == 2:
+                    usage = _pb_usage(val)
+                elif field == 11 and wire == 0:
+                    step_enum = val
+            timestamp = t_done or t_created
+            cache = as_int(usage.get("5"))
+            prompt = as_int(usage.get("2")) + cache
+            output = as_int(usage.get("3"))
+            if not timestamp or not (prompt or output):
+                continue
+            bot_id = usage.get("bot_id", "")
+            u_enum = usage.get("1") or step_enum
+            model, m_enum = gen_by_bot.get(bot_id, ("", u_enum))
+            if not model and m_enum in conv_models:
+                model = conv_models[m_enum]
+            if not model and m_enum is None and last_model[0]:
+                model, m_enum = last_model
+            resolved_model, backend = self._format_route(model, m_enum)
+            key = (self.SOURCE, f"{session_id}:{bot_id or f'step{idx}'}")
+            self.events[key] = UsageEvent(self.SOURCE, resolved_model, backend, timestamp, 1, prompt, output, cache, path_key)
+            self.file_keys[path_key].add(key)
+            added += 1
+
+        if added == 0:
+            self._read_transcript_fallback(tr_path, path_key, session_id)
+        self.file_state[path_key] = sig
+
+    def update(self, now: float) -> None:
+        self.error = ""
+        conv_dir, brain_dir = self._dirs()
+        if not conv_dir.is_dir():
+            self.error = "log directory not found"
+            self.files = []
+            self.file_count = 0
+        else:
+            self._refresh_file_list(now)
+            self.file_count = len(self.files)
+            if self.list_error:
+                self.error = self.list_error
+            else:
+                for path in self.files:
+                    self._read_file(path, brain_dir)
+        cutoff = now - max(90, self.history_days) * 86400
+        expired = [key for key, event in self.events.items() if event.timestamp < cutoff]
+        for key in expired:
+            self.events.pop(key, None)
+            for keys in self.file_keys.values():
+                keys.discard(key)
+        self.latest = max((event.timestamp for event in self.events.values()), default=None)
+
+
 class HermesUsage:
     def __init__(self, db_path: Path, gateway_path: Path):
         self.db_path = db_path
@@ -654,6 +982,7 @@ class RouteWatch:
         self.days = args.days
         self.index = FileUsageIndex(args.codex_dir, args.claude_dir, max(30, args.days * 2))
         self.dsh = DeepSeekHarnessUsage(args.dsh_dir, max(30, args.days * 2))
+        self.antigravity = AntigravityUsage(args.antigravity_dir, max(30, args.days * 2))
         self.hermes = HermesUsage(args.hermes_db, args.hermes_state)
         self.refresh = max(1, args.refresh)
         self.started = time.time()
@@ -667,7 +996,7 @@ class RouteWatch:
             "events": (), "hermes_rows": (), "hermes_rates": (),
             "source_status": {
                 name: {"files": 0, "latest": None, "error": "indexing"}
-                for name in ("Codex", "Claude Code", "DeepSeek", "Hermes")
+                for name in SOURCE_NAMES
             },
         }
         self.published["source_status"]["gateway"] = {"state": "loading", "latest": None, "agents": 0}
@@ -685,16 +1014,23 @@ class RouteWatch:
                 self.index.update(now)
                 self.dsh.set_history_days(history_days)
                 self.dsh.update(time.time())
+                self.antigravity.set_history_days(history_days)
+                self.antigravity.update(time.time())
                 self.hermes.update(time.time())
                 published = {
                     "history_days": history_days,
-                    "events": tuple(self.index.events.values()) + tuple(self.dsh.events.values()),
+                    "events": (
+                        tuple(self.index.events.values())
+                        + tuple(self.dsh.events.values())
+                        + tuple(self.antigravity.events.values())
+                    ),
                     "hermes_rows": tuple(self.hermes.rows),
                     "hermes_rates": tuple(self.hermes.rate_events),
                     "source_status": {
                         "Codex": {"files": self.index.file_counts["Codex"], "latest": self.index.latest["Codex"], "error": self.index.errors["Codex"]},
                         "Claude Code": {"files": self.index.file_counts["Claude Code"], "latest": self.index.latest["Claude Code"], "error": self.index.errors["Claude Code"]},
                         "DeepSeek": {"files": self.dsh.file_count, "latest": self.dsh.latest, "error": self.dsh.error},
+                        "Antigravity": {"files": self.antigravity.file_count, "latest": self.antigravity.latest, "error": self.antigravity.error},
                         "Hermes": {"files": self.hermes.row_count, "latest": self.hermes.latest, "error": self.hermes.error},
                         "gateway": {"state": self.hermes.gateway, "latest": self.hermes.gateway_age, "agents": self.hermes.active_agents},
                     },
@@ -717,6 +1053,7 @@ class RouteWatch:
     def request_refresh(self) -> None:
         self.index.last_list_refresh = 0
         self.dsh.last_list_refresh = 0
+        self.antigravity.last_list_refresh = 0
         self.wake_event.set()
 
     def snapshot(self, now: float | None = None, source: str = "All") -> dict[str, Any]:
@@ -801,7 +1138,7 @@ class RouteWatch:
             days.append({"date": day, **daily[day]})
 
         rate_by_source: dict[str, dict[str, float]] = defaultdict(lambda: {"prompt": 0.0, "output": 0.0})
-        for source_name in ("Codex", "Claude Code", "DeepSeek", "Hermes"):
+        for source_name in SOURCE_NAMES:
             rate_by_source[source_name]
         for event in events:
             if now - 60 <= event.timestamp <= now + 5:
@@ -873,7 +1210,7 @@ def print_snapshot(app: RouteWatch) -> None:
     print("ROUTEWATCH | GLOBAL MODEL ROUTING + TOKEN ANALYTICS")
     print(f"Window: {snap['days']} {'day' if snap['days'] == 1 else 'days'} ({snap['start_day']} to {snap['end_day']}) | Updated: {dt.datetime.fromtimestamp(snap['now']).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}")
     statuses = snap["source_status"]
-    for name in ("Codex", "Claude Code", "DeepSeek", "Hermes"):
+    for name in SOURCE_NAMES:
         item = statuses[name]
         issue = f" — {item['error']}" if item.get("error") else ""
         unit = "routes" if name == "Hermes" else "files"
@@ -915,7 +1252,7 @@ def safe_add(stdscr: Any, y: int, x: int, text: str, attr: int = 0) -> None:
 
 class DashboardUI:
     VIEWS = ("Overview", "Routes", "Trends", "Sources")
-    SOURCES = ("All", "Codex", "Claude Code", "DeepSeek", "Hermes")
+    SOURCES = ("All", *SOURCE_NAMES)
     SORTS = ("total", "output", "calls", "latest", "cache")
     METRICS = ("total", "prompt", "output", "cache", "calls")
 
@@ -1194,12 +1531,13 @@ class DashboardUI:
                 else:
                     safe_add(screen, 9 + i, 2, f"{name:11} {bar:<{bar_width}} {ratio:5.1%} {compact(amount):>8} {source_rate:>9,.1f}/s")
                 self.hits.append((9 + i, 2, width - 5, 'source_focus', i + 1))
+            trend_y = 9 + len(self.SOURCES) - 1
             values = [v['total'] for v in snap['timeline']]
             unit = 'hourly today' if snap['days'] == 1 else 'daily'
-            safe_add(screen, 13, 2, f"{unit:12} {trend_spark(values, width - 31)}", self.accent)
-            self.hits.append((13, 2, width - 5, 'view', 2))
-            safe_add(screen, 14, 2, 'ROUTES  /  Enter for details', self.dim)
-            self.table(screen, snap, 15, height - 3)
+            safe_add(screen, trend_y, 2, f"{unit:12} {trend_spark(values, width - 31)}", self.accent)
+            self.hits.append((trend_y, 2, width - 5, 'view', 2))
+            safe_add(screen, trend_y + 1, 2, 'ROUTES  /  Enter for details', self.dim)
+            self.table(screen, snap, trend_y + 2, height - 3)
         elif self.view == 1:
             count = len(self.route_rows(snap))
             self.button(screen, 8, 1, f's:sort {self.SORTS[self.sort]}', 'sort')
@@ -1232,6 +1570,7 @@ class DashboardUI:
                      'Hermes values are session aggregates assigned to last activity.' if route['source'] == 'Hermes' else
                      'Claude provider is not included in local usage records.' if route['source'] == 'Claude Code' else
                      'DeepSeek Harness (dsh): one usage record per model call, from its session logs.' if route['source'] == 'DeepSeek' else
+                     'Antigravity: one usage record per model step, from conversation SQLite DBs.' if route['source'] == 'Antigravity' else
                      'Model/provider come from Codex session context.',
                      'Esc / Enter: close']
             self.modal(screen, 'ROUTE DETAILS', lines)
@@ -1290,22 +1629,27 @@ class DashboardUI:
 
     def sources(self, screen, snap):
         height, width = screen.getmaxyx()
-        step = 4 if height >= 27 else 3
-        units = {'Hermes': 'usage rows', 'DeepSeek': 'session files'}
+        step = 4 if height >= 31 else 3 if height >= 25 else 2
+        units = {'Hermes': 'usage rows', 'DeepSeek': 'session files', 'Antigravity': 'session DBs'}
         for i, name in enumerate(self.SOURCES[1:]):
             y = 8 + i * step
             item = snap['source_status'][name]
             state = item['error'] or 'Connected'
             self.button(screen, y, 1, name, 'source_focus', i + 1)
             safe_add(screen, y, 19, state, self.good if not item['error'] else self.accent)
-            safe_add(screen, y + 1, 3, f"{item['files']:,} {units.get(name, 'log files')} | latest usage {short_age(item['latest'], snap['now'])}")
             rate = snap['rate']['sources'].get(name, {})
-            safe_add(screen, y + 2, 3, f"Recorded prompt {rate.get('prompt_per_sec', 0):,.1f}/s | output {rate.get('output_per_sec', 0):,.1f}/s", self.dim)
+            summary = f"{item['files']:,} {units.get(name, 'log files')} | latest usage {short_age(item['latest'], snap['now'])}"
+            if step == 2:
+                summary += f" | {rate.get('prompt_per_sec', 0) + rate.get('output_per_sec', 0):,.1f} tok/s"
+            safe_add(screen, y + 1, 3, summary)
+            if step >= 3:
+                safe_add(screen, y + 2, 3, f"Recorded prompt {rate.get('prompt_per_sec', 0):,.1f}/s | output {rate.get('output_per_sec', 0):,.1f}/s", self.dim)
         gw = snap['source_status']['gateway']
         y = 8 + (len(self.SOURCES) - 1) * step
         for text, attr in ((f"Hermes gateway: {gw['state']} | state {short_age(gw['latest'], snap['now'])} | agents {gw['agents']}", 0),
                            ('Local usage only. Claude transport provider is not recorded.', self.dim),
                            ('DeepSeek = DeepSeek Harness (dsh) sessions; failed attempts are not counted.', self.dim),
+                           ('Antigravity = local ~/.gemini/antigravity conversation databases.', self.dim),
                            ('Hermes rate starts after an observed DB increment.', self.dim)):
             if y < height - 3:
                 safe_add(screen, y, 2, text, attr)
@@ -1350,7 +1694,7 @@ def draw_dashboard(stdscr: Any, app: RouteWatch) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="routewatch",
-        description="Read-only terminal monitor for local Codex, Claude Code, DeepSeek Harness, and Hermes routing/token telemetry.",
+        description="Read-only terminal monitor for local Codex, Claude Code, DeepSeek Harness, Antigravity, and Hermes routing/token telemetry.",
         epilog="Rate is based on completed usage records; none of these local sources exposes live streamed TPS.",
     )
     parser.add_argument("--days", type=int, choices=(1, 7, 30, 90), default=30, help="trend window (default: 30)")
@@ -1359,6 +1703,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-dir", type=Path, default=DEFAULT_CODEX, help=f"Codex sessions directory (default: {DEFAULT_CODEX})")
     parser.add_argument("--claude-dir", type=Path, default=DEFAULT_CLAUDE, help=f"Claude Code projects directory (default: {DEFAULT_CLAUDE})")
     parser.add_argument("--dsh-dir", type=Path, default=DEFAULT_DSH, help=f"DeepSeek Harness sessions directory (default: {DEFAULT_DSH})")
+    parser.add_argument("--antigravity-dir", type=Path, default=DEFAULT_ANTIGRAVITY, help=f"Antigravity data directory (default: {DEFAULT_ANTIGRAVITY})")
     parser.add_argument("--hermes-db", type=Path, default=DEFAULT_HERMES_DB, help=f"Hermes state database (default: {DEFAULT_HERMES_DB})")
     parser.add_argument("--hermes-state", type=Path, default=DEFAULT_HERMES_STATE, help=f"Hermes gateway state JSON (default: {DEFAULT_HERMES_STATE})")
     return parser.parse_args()
