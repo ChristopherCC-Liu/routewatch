@@ -220,6 +220,15 @@ class FileUsageIndex:
             provider = payload.get("model_provider")
             if isinstance(provider, str) and provider:
                 state["provider"] = provider
+        elif kind == "event_msg" and payload.get("type") == "thread_settings_applied":
+            ts = payload.get("thread_settings")
+            if isinstance(ts, dict):
+                model = ts.get("model") or ts.get("model_name")
+                if isinstance(model, str) and model:
+                    state["model"] = model
+                provider = ts.get("model_provider_id") or ts.get("model_provider")
+                if isinstance(provider, str) and provider:
+                    state["provider"] = provider
         elif kind == "turn_context":
             model = payload.get("model") or payload.get("model_name")
             if isinstance(model, str) and model:
@@ -240,8 +249,11 @@ class FileUsageIndex:
             response_id = payload.get("response_id")
             if not isinstance(response_id, str) or not response_id:
                 response_id = f"{timestamp:.6f}:{prompt}:{output}:{cache}"
-            provider = state.get("provider") or "Codex"
-            event = UsageEvent("Codex", format_model(state.get("model")), provider,
+            raw_model = payload.get("model") or payload.get("model_name")
+            model = raw_model if isinstance(raw_model, str) and raw_model else state.get("model")
+            raw_provider = payload.get("model_provider") or payload.get("model_provider_id")
+            provider = raw_provider if isinstance(raw_provider, str) and raw_provider else (state.get("provider") or "Codex")
+            event = UsageEvent("Codex", format_model(model), provider,
                                timestamp, 1, prompt, output, cache, path)
             self._add_event(path, ("Codex", response_id), event)
 
@@ -613,19 +625,46 @@ class AntigravityUsage:
 
     SOURCE = "Antigravity"
     ENUM_MODELS = {
+        1198: "gemini-3.5-flash-lite",
+        1318: "gemini-3.8-flash",
         1319: "gemini-3.8-flash",
+        1320: "gemini-3.8-flash",
         1322: "gemini-3.8-flash-tiered",
+        1400: "claude-opus-5-5-low",
         1401: "claude-opus-5-5-medium",
         1402: "claude-opus-5-5-high",
+        1403: "claude-sonnet-5-5-low",
         1404: "claude-sonnet-5-5-medium",
         1417: "gemini-4-argon",
         1418: "gemini-4-argon",
         1419: "gemini-4-argon",
+        1427: "gemini-4-carbon",
+        1437: "gemini-4-carbon",
+        1438: "gemini-4-carbon",
+        1525: "gemini-4-hydrogen",
+        1526: "gemini-4-hydrogen",
+        1527: "gemini-4-hydrogen",
+        1528: "gemini-4-hydrogen",
     }
     ENUM_EFFORT = {
+        1318: "high",
+        1319: "medium",
+        1320: "low",
+        1400: "low",
+        1401: "medium",
+        1402: "high",
+        1403: "low",
+        1404: "medium",
         1417: "high",
         1418: "medium",
         1419: "low",
+        1427: "high",
+        1437: "medium",
+        1438: "low",
+        1525: "high",
+        1526: "medium",
+        1527: "low",
+        1528: "xhigh",
     }
     UI_MODEL_RE = re.compile(r"setting `Model Selection` from .+? to ([^\n.]+)")
 
@@ -685,13 +724,16 @@ class AntigravityUsage:
             self.events.pop(key, None)
 
     @classmethod
-    def _format_route(cls, model: str, model_enum: int | None) -> tuple[str, str]:
-        resolved = format_model(model or (cls.ENUM_MODELS.get(model_enum or 0, "")))
+    def _format_route(cls, model: str, model_enum: int | None, ui_label: str = "") -> tuple[str, str]:
+        ui_model, ui_backend = cls._parse_ui_selection(ui_label) if ui_label else ("", "")
+        ui_effort = ui_backend.split("/", 1)[1] if "/" in ui_backend else ""
+        resolved = format_model(model or cls.ENUM_MODELS.get(model_enum or 0, "") or ui_model)
         provider = "anthropic" if "claude" in resolved.lower() else "google"
-        effort = cls.ENUM_EFFORT.get(model_enum or 0, "")
-        if effort and not resolved.endswith(f"-{effort}"):
+        effort = ui_effort or cls.ENUM_EFFORT.get(model_enum or 0, "")
+        suffixes = ("xhigh", "high", "medium", "low", "extra-low", "max", "tiered")
+        if effort and not any(resolved.endswith(f"-{s}") for s in suffixes):
             resolved = f"{resolved}-{effort}"
-        for suffix in ("high", "medium", "low", "max", "tiered"):
+        for suffix in suffixes:
             if resolved.endswith(f"-{suffix}"):
                 return resolved, f"{provider}/{suffix}"
         return resolved, provider
@@ -699,23 +741,56 @@ class AntigravityUsage:
     @classmethod
     def _parse_ui_selection(cls, label: str) -> tuple[str, str]:
         raw = label.strip()
+        if not raw:
+            return "", ""
         lower = raw.lower()
         effort = ""
-        for level in ("high", "medium", "low", "max"):
-            if f"({level})" in lower:
+        for pat, level in (
+            ("(xhigh)", "xhigh"),
+            ("(extra low)", "extra-low"),
+            ("(extra-low)", "extra-low"),
+            ("(high)", "high"),
+            ("(medium)", "medium"),
+            ("(low)", "low"),
+            ("(max)", "max"),
+            ("(tiered)", "tiered"),
+        ):
+            if pat in lower:
                 effort = level
                 break
         if "argon" in lower:
-            return f"gemini-4-argon-{effort}" if effort else "gemini-4-argon", f"google/{effort}" if effort else "google"
+            slug = "gemini-4-argon"
+            return f"{slug}-{effort}" if effort else slug, f"google/{effort}" if effort else "google"
+        if "carbon" in lower:
+            slug = "gemini-4-carbon"
+            return f"{slug}-{effort}" if effort else slug, f"google/{effort}" if effort else "google"
+        if "hydrogen" in lower:
+            slug = "gemini-4-hydrogen"
+            return f"{slug}-{effort}" if effort else slug, f"google/{effort}" if effort else "google"
         if "claude" in lower and "sonnet" in lower:
             slug = "claude-sonnet-5-5" if "5.5" in lower else "claude-sonnet-5"
             return f"{slug}-{effort}" if effort else slug, f"anthropic/{effort}" if effort else "anthropic"
         if "claude" in lower and "opus" in lower:
             slug = "claude-opus-5-5" if "5.5" in lower else "claude-opus-5"
             return f"{slug}-{effort}" if effort else slug, f"anthropic/{effort}" if effort else "anthropic"
-        if "3.8" in lower and "flash" in lower:
-            return f"gemini-3.8-flash-{effort}" if effort else "gemini-3.8-flash", f"google/{effort}" if effort else "google"
+        if "flash" in lower and "lite" in lower:
+            if "3.5" in lower:
+                slug = "gemini-3.5-flash-lite"
+            elif "3.1" in lower:
+                slug = "gemini-3.1-flash-lite"
+            else:
+                slug = re.sub(r"[^a-z0-9.]+", "-", re.sub(r"\([^)]*\)", "", lower)).strip("-")
+            return f"{slug}-{effort}" if effort else slug, f"google/{effort}" if effort else "google"
+        for ver in ("3.8", "3.7", "3.6", "3.5"):
+            if ver in lower and "flash" in lower:
+                slug = f"gemini-{ver}-flash"
+                return f"{slug}-{effort}" if effort else slug, f"google/{effort}" if effort else "google"
+        if "3.1" in lower and "pro" in lower:
+            slug = "gemini-3.1-pro"
+            return f"{slug}-{effort}" if effort else slug, f"google/{effort}" if effort else "google"
         slug = re.sub(r"[^a-z0-9.]+", "-", re.sub(r"\([^)]*\)", "", lower)).strip("-")
+        if effort and not slug.endswith(f"-{effort}"):
+            slug = f"{slug}-{effort}"
         provider = "anthropic" if "claude" in slug else "google"
         return format_model(slug), f"{provider}/{effort}" if effort else provider
 
@@ -786,9 +861,10 @@ class AntigravityUsage:
             self.file_state[path_key] = sig
             return
 
-        gen_by_bot: dict[str, tuple[str, int | None]] = {}
+        gen_by_bot: dict[str, tuple[str, int | None, str]] = {}
         conv_models: dict[int, str] = {}
-        last_model: tuple[str, int | None] = ("", None)
+        conv_labels: dict[int, str] = {}
+        last_model: tuple[str, int | None, str] = ("", None, "")
         for _idx, blob in gen_rows:
             if not isinstance(blob, (bytes, memoryview)):
                 continue
@@ -798,6 +874,7 @@ class AntigravityUsage:
                 model = ""
                 model_enum: int | None = None
                 bot_id = ""
+                ui_label = ""
                 for f2, w2, v2 in _pb_fields(val):
                     if f2 == 3 and w2 == 0:
                         model_enum = v2
@@ -805,12 +882,19 @@ class AntigravityUsage:
                         bot_id = _pb_usage(v2).get("bot_id", "")
                     elif f2 == 19 and w2 == 2:
                         model = v2.decode("utf-8", errors="replace").strip()
-                if model_enum is not None and model:
-                    conv_models[model_enum] = model
-                if model or model_enum is not None:
-                    last_model = (model, model_enum)
+                    elif f2 == 21 and w2 == 2:
+                        cand = v2.decode("utf-8", errors="replace").strip()
+                        if cand and "\ufffd" not in cand and all(ord(c) >= 32 for c in cand):
+                            ui_label = cand
+                if model_enum is not None:
+                    if model:
+                        conv_models[model_enum] = model
+                    if ui_label:
+                        conv_labels[model_enum] = ui_label
+                if model or model_enum is not None or ui_label:
+                    last_model = (model, model_enum, ui_label)
                 if bot_id:
-                    gen_by_bot[bot_id] = (model, model_enum)
+                    gen_by_bot[bot_id] = (model, model_enum, ui_label)
 
         added = 0
         for idx, _stype, meta in step_rows:
@@ -836,12 +920,14 @@ class AntigravityUsage:
                 continue
             bot_id = usage.get("bot_id", "")
             u_enum = usage.get("1") or step_enum
-            model, m_enum = gen_by_bot.get(bot_id, ("", u_enum))
+            model, m_enum, ui_label = gen_by_bot.get(bot_id, ("", u_enum, ""))
             if not model and m_enum in conv_models:
                 model = conv_models[m_enum]
-            if not model and m_enum is None and last_model[0]:
-                model, m_enum = last_model
-            resolved_model, backend = self._format_route(model, m_enum)
+            if not ui_label and m_enum in conv_labels:
+                ui_label = conv_labels[m_enum]
+            if not model and not ui_label and m_enum is None and (last_model[0] or last_model[1] is not None or last_model[2]):
+                model, m_enum, ui_label = last_model
+            resolved_model, backend = self._format_route(model, m_enum, ui_label)
             key = (self.SOURCE, f"{session_id}:{bot_id or f'step{idx}'}")
             self.events[key] = UsageEvent(self.SOURCE, resolved_model, backend, timestamp, 1, prompt, output, cache, path_key)
             self.file_keys[path_key].add(key)
@@ -927,19 +1013,53 @@ class HermesUsage:
             self.error = "state database not found"
             self.rows = []
             return
-        try:
-            db = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=0.5)
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA query_only=ON")
-            rows = db.execute(
-                """SELECT m.session_id, m.model, m.billing_provider, m.billing_mode, m.task,
-                          m.api_call_count, m.input_tokens, m.output_tokens,
-                          m.cache_read_tokens, m.cache_write_tokens, m.last_seen
-                   FROM session_model_usage AS m"""
-            ).fetchall()
-            db.close()
-        except sqlite3.Error as exc:
-            self.error = f"state database read failed ({type(exc).__name__})"
+        rows: list[sqlite3.Row] = []
+        last_exc: sqlite3.Error | None = None
+        sessions_sql = """SELECT id AS session_id, model, billing_provider, billing_mode,
+                                 COALESCE(source, '') AS task,
+                                 api_call_count, input_tokens, output_tokens,
+                                 cache_read_tokens, cache_write_tokens,
+                                 COALESCE(ended_at, started_at) AS last_seen
+                          FROM sessions
+                          WHERE COALESCE(api_call_count, 0) > 0
+                             OR COALESCE(input_tokens, 0) > 0
+                             OR COALESCE(output_tokens, 0) > 0
+                             OR COALESCE(cache_read_tokens, 0) > 0
+                             OR COALESCE(cache_write_tokens, 0) > 0"""
+        for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
+            db = None
+            try:
+                db = sqlite3.connect(f"file:{self.db_path}{suffix}", uri=True, timeout=0.5)
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA query_only=ON")
+                try:
+                    rows = db.execute(
+                        """SELECT m.session_id, m.model, m.billing_provider, m.billing_mode, m.task,
+                                  m.api_call_count, m.input_tokens, m.output_tokens,
+                                  m.cache_read_tokens, m.cache_write_tokens, m.last_seen
+                           FROM session_model_usage AS m"""
+                    ).fetchall()
+                    if not rows:
+                        try:
+                            rows = db.execute(sessions_sql).fetchall()
+                        except sqlite3.OperationalError:
+                            pass
+                except sqlite3.OperationalError as exc:
+                    if "no such table" not in str(exc).lower():
+                        raise
+                    rows = db.execute(sessions_sql).fetchall()
+                last_exc = None
+                break
+            except sqlite3.Error as exc:
+                last_exc = exc
+            finally:
+                if db is not None:
+                    try:
+                        db.close()
+                    except sqlite3.Error:
+                        pass
+        if last_exc is not None:
+            self.error = f"state database read failed ({type(last_exc).__name__})"
             return
         clean: list[dict[str, Any]] = []
         current: dict[tuple[Any, ...], tuple[int, int, int, int]] = {}
@@ -1264,36 +1384,55 @@ class DashboardUI:
 
     def __init__(self, app: RouteWatch):
         self.app = app
-        self.view = self.source = self.sort = self.metric = self.selected = 0
+        self.view = self.source = self.sort = self.metric = self.selected = self.source_cursor = 0
+        self.sort_desc = True
         self.cursor = None
         self.selected_key = None
         self.query = ""
         self.old_query = ""
         self.searching = self.paused = self.details = self.help = False
         self.needs_snapshot = True
-        self.routes = []
-        self.hits = []
+        self.routes: list[dict[str, Any]] = []
+        self.hits: list[tuple[int, int, int, str, Any]] = []
         self.accent = curses.A_BOLD
         self.dim = curses.A_DIM
         self.good = curses.A_BOLD
+        self.warn = curses.A_BOLD
+        self.purple = curses.A_BOLD
+        self.blue = curses.A_BOLD
+        self.bad = curses.A_BOLD
+        self.source_colors: dict[str, int] = {}
         self.note = ""
+        self.note_until = 0.0
+
+    def set_note(self, text: str, duration: float = 3.0) -> None:
+        self.note = text
+        self.note_until = time.monotonic() + duration
+
+    def source_attr(self, name: str) -> int:
+        return self.source_colors.get(name, self.accent)
 
     @staticmethod
     def route_key(route):
         return route["source"], route["model"], route["backend"]
 
-    def button(self, screen, y, x, label, action, value=None, active=False):
+    def button(self, screen, y, x, label, action, value=None, active=False, attr=None):
         text = f" {label} "
-        safe_add(screen, y, x, text, curses.A_REVERSE | curses.A_BOLD if active else self.accent)
+        style = (curses.A_REVERSE | curses.A_BOLD) if active else (self.accent if attr is None else attr)
+        safe_add(screen, y, x, text, style)
         self.hits.append((y, x, len(text), action, value))
         return x + len(text) + 1
 
     def route_rows(self, snap):
-        rows = [r for r in snap["routes"] if self.query.casefold() in
-                " ".join((r["source"], r["model"], r["backend"])).casefold()]
+        q = self.query.casefold()
+        rows = [r for r in snap["routes"] if not q or q in
+                f"{r['source']} {r['model']} {r['backend']}".casefold()]
         metric = self.SORTS[self.sort]
-        rows.sort(key=lambda r: (r["prompt"] + r["output"] if metric == "total" else r[metric],
-                                 r["model"], r["backend"]), reverse=True)
+        rows.sort(
+            key=lambda r: (r["prompt"] + r["output"] if metric == "total" else r[metric],
+                           r["model"], r["backend"]),
+            reverse=self.sort_desc,
+        )
         if self.selected_key is not None:
             self.selected = next((i for i, r in enumerate(rows) if self.route_key(r) == self.selected_key), self.selected)
         self.selected = min(max(0, self.selected), max(0, len(rows) - 1))
@@ -1315,7 +1454,10 @@ class DashboardUI:
             self.paused = False
             self.needs_snapshot = True
         elif action in ("source", "source_focus"):
-            self.source = (self.source + 1) % len(self.SOURCES) if value is None else value
+            if value is None:
+                self.source = (self.source + 1) % len(self.SOURCES)
+            else:
+                self.source = value % len(self.SOURCES)
             self.selected_key = None
             self.selected = 0
             self.paused = False
@@ -1323,19 +1465,45 @@ class DashboardUI:
             if action == "source_focus":
                 self.view = 0
         elif action == "sort":
-            self.sort = (self.sort + 1) % len(self.SORTS)
+            self.sort = (self.sort + (1 if value is None else value)) % len(self.SORTS)
+            self.selected_key = None
+            self.selected = 0
+        elif action == "sort_col":
+            idx = self.SORTS.index(value) if value in self.SORTS else 0
+            if self.sort == idx:
+                self.sort_desc = not self.sort_desc
+            else:
+                self.sort = idx
+                self.sort_desc = True
+            self.selected_key = None
+            self.selected = 0
+        elif action == "sort_dir":
+            self.sort_desc = not self.sort_desc
             self.selected_key = None
             self.selected = 0
         elif action == "metric":
-            self.metric = (self.metric + 1) % len(self.METRICS)
+            if value is None:
+                self.metric = (self.metric + 1) % len(self.METRICS)
+            elif isinstance(value, int) and value < 0:
+                self.metric = (self.metric + value) % len(self.METRICS)
+            else:
+                self.metric = int(value) % len(self.METRICS)
         elif action == "pause":
             self.paused = not self.paused
             self.needs_snapshot = not self.paused
+            self.set_note("Display paused (collection active)" if self.paused else "Live updates resumed", 2.0)
         elif action == "route":
-            self.selected = value
-            self.selected_key = self.route_key(self.routes[value])
+            if 0 <= value < len(self.routes):
+                self.selected = value
+                self.selected_key = self.route_key(self.routes[value])
+        elif action == "source_pick":
+            self.source_cursor = value % len(SOURCE_NAMES)
         elif action == "cursor":
             self.cursor = value
+        elif action == "clear":
+            self.query = ""
+            self.dispatch("source", 0)
+            self.set_note("Filters cleared", 2.0)
         elif action == "help":
             self.help = not self.help
         elif action == "close":
@@ -1344,7 +1512,7 @@ class DashboardUI:
             self.app.request_refresh()
             self.paused = False
             self.needs_snapshot = True
-            self.note = "Refresh requested"
+            self.set_note("Refresh requested", 2.5)
 
     def handle(self, key, snap):
         if self.searching:
@@ -1365,8 +1533,8 @@ class DashboardUI:
         if key == 27:
             if self.details or self.help:
                 self.details = self.help = False
-            else:
-                self.query = ""
+            elif self.query or self.source:
+                self.dispatch("clear")
             return True
         if key == ord('?'):
             self.help = not self.help
@@ -1375,9 +1543,21 @@ class DashboardUI:
             try:
                 _, mx, my, _, buttons = curses.getmouse()
                 if buttons & getattr(curses, 'BUTTON4_PRESSED', 0):
-                    self.move_route(-1)
+                    if self.view == 2 and snap['timeline']:
+                        cur = (len(snap['timeline']) - 1) if self.cursor is None else self.cursor
+                        self.cursor = max(0, cur - 1)
+                    elif self.view == 3:
+                        self.source_cursor = (self.source_cursor - 1) % len(SOURCE_NAMES)
+                    else:
+                        self.move_route(-1)
                 elif buttons & getattr(curses, 'BUTTON5_PRESSED', 0):
-                    self.move_route(1)
+                    if self.view == 2 and snap['timeline']:
+                        cur = (len(snap['timeline']) - 1) if self.cursor is None else self.cursor
+                        self.cursor = min(len(snap['timeline']) - 1, cur + 1)
+                    elif self.view == 3:
+                        self.source_cursor = (self.source_cursor + 1) % len(SOURCE_NAMES)
+                    else:
+                        self.move_route(1)
                 elif buttons & (getattr(curses, 'BUTTON1_CLICKED', 0) |
                                 getattr(curses, 'BUTTON1_DOUBLE_CLICKED', 0) |
                                 getattr(curses, 'BUTTON1_RELEASED', 0)):
@@ -1398,12 +1578,20 @@ class DashboardUI:
             self.dispatch("view", (self.view + (-1 if key == curses.KEY_BTAB else 1)) % 4)
         elif key in tuple(map(ord, '1234')):
             self.dispatch("days", (1, 7, 30, 90)[key - ord('1')])
+        elif key == ord('0'):
+            self.dispatch("source", 0)
         elif key == ord('f'):
             self.dispatch("source")
+        elif key == ord('F'):
+            self.dispatch("source", self.source - 1)
         elif key == ord('s'):
             self.dispatch("sort")
+        elif key in (ord('S'), ord('o')):
+            self.dispatch("sort_dir")
         elif key == ord('m'):
             self.dispatch("metric")
+        elif key == ord('M'):
+            self.dispatch("metric", -1)
         elif key in (ord(' '), ord('p')):
             self.dispatch("pause")
         elif key == ord('r'):
@@ -1413,10 +1601,12 @@ class DashboardUI:
             self.old_query = self.query
             self.searching = True
         elif key == ord('x'):
-            self.query = ""
-            self.dispatch("source", 0)
-        elif key in (10, 13, curses.KEY_ENTER) and self.view in (0, 1) and self.routes:
-            self.details = True
+            self.dispatch("clear")
+        elif key in (10, 13, curses.KEY_ENTER):
+            if self.view in (0, 1) and self.routes:
+                self.details = True
+            elif self.view == 3:
+                self.dispatch("source_focus", self.source_cursor + 1)
         elif self.view == 2:
             end = len(snap['timeline']) - 1
             cursor = end if self.cursor is None else self.cursor
@@ -1428,6 +1618,11 @@ class DashboardUI:
                 self.cursor = 0
             elif key == curses.KEY_END:
                 self.cursor = end
+        elif self.view == 3:
+            if key in (curses.KEY_UP, ord('k')):
+                self.source_cursor = (self.source_cursor - 1) % len(SOURCE_NAMES)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                self.source_cursor = (self.source_cursor + 1) % len(SOURCE_NAMES)
         elif self.view in (0, 1):
             if key in (curses.KEY_UP, ord('k')):
                 self.move_route(-1)
@@ -1446,25 +1641,93 @@ class DashboardUI:
     def table(self, screen, snap, top, bottom):
         _, width = screen.getmaxyx()
         rows = self.route_rows(snap)
-        model_width = max(16, width - 52)
-        safe_add(screen, top, 2, f"{'SOURCE':11} {'MODEL':{model_width}} {'CALLS':>7} {'TOTAL':>9} {'OUTPUT':>8}", self.dim)
+        wide = width >= 98
+        arrow = "▼" if self.sort_desc else "▲"
+        sort_key = self.SORTS[self.sort]
+
+        def hdr(title: str, key_name: str, align_w: int) -> str:
+            label = f"{title}{arrow}" if sort_key == key_name else title
+            return f"{label:>{align_w}}"
+
+        if wide:
+            fixed = 11 + 1 + 1 + 20 + 1 + 8 + 1 + 7 + 1 + 10 + 1 + 9 + 1 + 7 + 4
+            model_width = max(18, width - fixed)
+            x = 2
+            cols = [
+                (f"{'SOURCE':11}", None),
+                (f"{'MODEL':{model_width}}", None),
+                (f"{'BACKEND / MODE':20}", None),
+                (hdr('CALLS', 'calls', 8), 'calls'),
+                (hdr('CACHE%', 'cache', 7), 'cache'),
+                (hdr('TOTAL', 'total', 10), 'total'),
+                (hdr('OUTPUT', 'output', 9), 'output'),
+                (hdr('AGE', 'latest', 7), 'latest'),
+            ]
+            for label, col_sort in cols:
+                attr = self.accent if col_sort == sort_key else self.dim
+                safe_add(screen, top, x, label, attr)
+                if col_sort:
+                    self.hits.append((top, x, len(label), 'sort_col', col_sort))
+                x += len(label) + 1
+        else:
+            model_width = max(14, width - 47)
+            x = 2
+            cols = [
+                (f"{'SOURCE':11}", None),
+                (f"{'MODEL':{model_width}}", None),
+                (hdr('CALLS', 'calls', 8), 'calls'),
+                (hdr('TOTAL', 'total', 10), 'total'),
+                (hdr('OUTPUT', 'output', 9), 'output'),
+            ]
+            for label, col_sort in cols:
+                attr = self.accent if col_sort == sort_key else self.dim
+                safe_add(screen, top, x, label, attr)
+                if col_sort:
+                    self.hits.append((top, x, len(label), 'sort_col', col_sort))
+                x += len(label) + 1
+
         count = max(1, bottom - top - 1)
         start = max(0, min(self.selected - count + 1, len(rows) - count))
         for offset, route in enumerate(rows[start:start + count]):
             index = start + offset
             y = top + 1 + offset
-            text = f"{route['source']:11} {route['model'][:model_width]:{model_width}} {compact(route['calls']):>7} {compact(route['prompt'] + route['output']):>9} {compact(route['output']):>8}"
             selected = index == self.selected
-            safe_add(screen, y, 1, (' ' + text).ljust(width - 3), curses.A_REVERSE if selected else 0)
+            total_tok = route['prompt'] + route['output']
+            if wide:
+                cache_pct = f"{route['cache'] / route['prompt'] * 100:5.1f}%" if route['prompt'] else "  0.0%"
+                age = short_age(route['latest'], snap['now']).replace(" ago", "")[:7]
+                rest = (
+                    f"{route['model'][:model_width]:{model_width}} "
+                    f"{route['backend'][:20]:20} "
+                    f"{compact(route['calls']):>8} "
+                    f"{cache_pct:>7} "
+                    f"{compact(total_tok):>10} "
+                    f"{compact(route['output']):>9} "
+                    f"{age:>7}"
+                )
+            else:
+                rest = (
+                    f"{route['model'][:model_width]:{model_width}} "
+                    f"{compact(route['calls']):>8} "
+                    f"{compact(total_tok):>10} "
+                    f"{compact(route['output']):>9}"
+                )
+            if selected:
+                line = f">{route['source'][:11]:11} {rest}"
+                safe_add(screen, y, 1, line.ljust(width - 3), curses.A_REVERSE | curses.A_BOLD)
+            else:
+                safe_add(screen, y, 1, " ", 0)
+                safe_add(screen, y, 2, f"{route['source'][:11]:11}", self.source_attr(route['source']))
+                safe_add(screen, y, 14, rest, 0)
             self.hits.append((y, 1, width - 3, "route", index))
         if not rows:
-            safe_add(screen, top + 2, 3, "No matching routes. Press x to clear filters.", self.dim)
-        return len(rows)
+            safe_add(screen, top + 2, 3, "No matching routes. Press x or Esc to clear filters.", self.dim)
+        return len(rows), start, min(len(rows), start + count)
 
     def modal(self, screen, title, lines):
         import textwrap
         height, width = screen.getmaxyx()
-        box_width = min(90, width - 6)
+        box_width = min(88, width - 4)
         wrapped = []
         for line in lines:
             wrapped.extend(textwrap.wrap(line, box_width - 6) or [''])
@@ -1473,17 +1736,17 @@ class DashboardUI:
         self.hits = []
         for row in range(box_height):
             safe_add(screen, y + row, x, ' ' * box_width, curses.A_REVERSE)
-        safe_add(screen, y, x, '+' + '-' * (box_width - 2) + '+', self.accent)
+        safe_add(screen, y, x, '┌' + '─' * (box_width - 2) + '┐', self.accent)
         safe_add(screen, y + 1, x + 2, title, curses.A_BOLD | curses.A_REVERSE)
         self.button(screen, y + 1, x + box_width - 9, 'close', 'close')
         for row, line in enumerate(wrapped[:box_height - 4]):
             safe_add(screen, y + 3 + row, x + 2, line, curses.A_REVERSE)
-        safe_add(screen, y + box_height - 1, x, '+' + '-' * (box_width - 2) + '+', self.accent)
+        safe_add(screen, y + box_height - 1, x, '└' + '─' * (box_width - 2) + '┘', self.accent)
 
     def render(self, screen, snap):
         height, width = screen.getmaxyx()
-        layout = (height, width, self.view, self.source, self.sort, self.metric,
-                  self.query, self.details, self.help, snap['days'])
+        layout = (height, width, self.view, self.source, self.sort, self.sort_desc, self.metric,
+                  self.query, self.details, self.help, snap['days'], self.searching)
         if getattr(self, '_layout', None) != layout:
             screen.clear()
             self._layout = layout
@@ -1492,115 +1755,207 @@ class DashboardUI:
         self.hits = []
         if width < 72 or height < 22:
             safe_add(screen, 0, 0, "ROUTEWATCH | Enlarge terminal to at least 72 x 22.", self.accent)
-            safe_add(screen, 2, 0, "q: quit | current size " + str(width) + " x " + str(height))
+            safe_add(screen, 2, 0, f"q: quit | current size {width} x {height}")
             screen.refresh()
             return
-        state = "PAUSED" if self.paused else "INDEXING" if snap['indexing'] else "LIVE"
+
+        err_count = sum(1 for name in SOURCE_NAMES if snap['source_status'][name].get('error'))
+        if self.paused:
+            state_txt, state_attr = "|| PAUSED", self.warn
+        elif snap['indexing']:
+            state_txt, state_attr = ".. INDEX", self.warn
+        elif err_count:
+            state_txt, state_attr = f"! {err_count} ERR", self.bad
+        else:
+            state_txt, state_attr = "● LIVE", self.good
+
         stamp = dt.datetime.fromtimestamp(snap['now']).strftime('%H:%M:%S')
-        safe_add(screen, 0, 2, "ROUTEWATCH  /  GLOBAL MODEL TELEMETRY", self.accent)
-        safe_add(screen, 0, width - 22, f"{state:8} {stamp}", self.good)
+        safe_add(screen, 0, 2, "◆ ROUTEWATCH", self.accent)
+        if width >= 84:
+            safe_add(screen, 0, 15, "/  GLOBAL MODEL ROUTING + TELEMETRY", self.dim)
+        safe_add(screen, 0, max(2, width - 20), f"{state_txt:>9} {stamp}", state_attr)
+
         x = 1
         for i, label in enumerate(self.VIEWS):
             x = self.button(screen, 1, x, label, 'view', i, i == self.view)
+        if self.source or self.query:
+            badge = f"filter:{self.SOURCES[self.source]}" + (f" /{self.query}" if self.query else "")
+            max_badge = max(8, width - x - 14)
+            if x + 12 < width - 8:
+                x = self.button(screen, 1, x + 1, f"{badge[:max_badge]} x", 'clear', attr=self.warn)
         self.button(screen, 1, width - 5, '?', 'help')
+
         x = 1
         for i, days in enumerate((1, 7, 30, 90)):
             x = self.button(screen, 2, x, f'{i+1}:{days}d', 'days', days, snap['days'] == days)
-        x = self.button(screen, 2, x, f'f:{self.SOURCES[self.source]}', 'source')
-        self.button(screen, 2, x, 'resume' if self.paused else 'pause', 'pause', active=self.paused)
+        x = self.button(screen, 2, x, f'f:{self.SOURCES[self.source]}', 'source',
+                        attr=self.source_attr(self.SOURCES[self.source]) if self.source else self.accent)
+        x = self.button(screen, 2, x, 'resume' if self.paused else 'pause', 'pause', active=self.paused)
+        if x + 10 < width:
+            self.button(screen, 2, x, 'refresh', 'refresh', attr=self.dim)
         safe_add(screen, 3, 1, '─' * (width - 3), self.dim)
+
         totals = snap['totals']
+        prev = snap['previous']
         total = totals['prompt'] + totals['output']
+        prev_total = prev['prompt'] + prev['output']
+        tok_delta = pct_change(total, prev_total)
+        call_delta = pct_change(totals['calls'], prev['calls'])
         share = totals['cache'] / totals['prompt'] * 100 if totals['prompt'] else 0
         card_width = (width - 4) // 3
-        cards = [('TOKENS', compact(total), f"Prompt {compact(totals['prompt'])} / Out {compact(totals['output'])}"),
-                 ('CALLS / CACHE', compact(totals['calls']), f"Cache {compact(totals['cache'])} ({share:.1f}%)"),
-                 ('RECORDED RATE / 60s', f"{snap['rate']['prompt'] + snap['rate']['output']:,.1f}/s", f"Output {snap['rate']['output']:,.1f}/s")]
-        for i, (label, value, detail) in enumerate(cards):
-            x = 2 + i * card_width
-            safe_add(screen, 4, x, label[:card_width - 1], self.dim)
-            safe_add(screen, 5, x, value, self.accent)
-            safe_add(screen, 6, x, detail[:card_width - 1])
+        cards = [
+            ('TOKENS', compact(total), tok_delta,
+             f"In {compact(totals['prompt'])} · Out {compact(totals['output'])}"),
+            ('CALLS / CACHE', compact(totals['calls']), call_delta,
+             f"Cache {compact(totals['cache'])} ({share:.1f}%)"),
+            ('RECORDED RATE / 60s', f"{snap['rate']['prompt'] + snap['rate']['output']:,.1f}/s", '',
+             f"Out {snap['rate']['output']:,.1f}/s · {len(snap['routes'])} routes"),
+        ]
+        for i, (label, value, delta, detail) in enumerate(cards):
+            cx = 2 + i * card_width
+            if i > 0:
+                for ry in (4, 5, 6):
+                    safe_add(screen, ry, cx - 2, '│', self.dim)
+            safe_add(screen, 4, cx, label[:card_width - 3], self.dim)
+            safe_add(screen, 5, cx, value, self.accent)
+            if delta and cx + len(value) + 2 + len(delta) < cx + card_width - 2:
+                d_attr = self.good if delta.startswith(('+', 'new')) else (self.warn if delta.startswith('-') else self.dim)
+                safe_add(screen, 5, cx + len(value) + 2, f"{delta}", d_attr)
+            safe_add(screen, 6, cx, detail[:card_width - 3])
         safe_add(screen, 7, 1, '─' * (width - 3), self.dim)
+
         if self.view == 0:
             safe_add(screen, 8, 2, 'SOURCE SHARE', self.accent)
-            bar_width = max(6, width - 56)
+            safe_add(screen, 8, 16, f"({snap['start_day']} .. {snap['end_day']})", self.dim)
+            wide = width >= 98
+            bar_width = max(8, width - (56 if wide else 46))
             for i, name in enumerate(self.SOURCES[1:]):
+                y = 9 + i
                 metrics = snap['sources'].get(name, {})
                 amount = metrics.get('prompt', 0) + metrics.get('output', 0)
+                calls = metrics.get('calls', 0)
                 ratio = amount / total if total else 0
                 rate = snap['rate']['sources'].get(name, {})
                 source_rate = rate.get('prompt_per_sec', 0) + rate.get('output_per_sec', 0)
-                bar = '█' * round(ratio * bar_width)
+                src_attr = self.source_attr(name)
+                err = snap['source_status'][name].get('error', '')
                 if self.source and name != self.SOURCES[self.source]:
-                    safe_add(screen, 9 + i, 2, f"{name:11} Outside filter - click to inspect", self.dim)
+                    safe_add(screen, y, 2, f"· {name:11} Outside filter — click to inspect", self.dim)
                 else:
-                    safe_add(screen, 9 + i, 2, f"{name:11} {bar:<{bar_width}} {ratio:5.1%} {compact(amount):>8} {source_rate:>9,.1f}/s")
-                self.hits.append((9 + i, 2, width - 5, 'source_focus', i + 1))
+                    fill = round(ratio * bar_width)
+                    safe_add(screen, y, 2, "● ", src_attr)
+                    safe_add(screen, y, 4, f"{name:11}", src_attr)
+                    bx = 16
+                    safe_add(screen, y, bx, '█' * fill, src_attr)
+                    if fill < bar_width:
+                        safe_add(screen, y, bx + fill, '░' * (bar_width - fill), self.dim)
+                    rx = bx + bar_width + 1
+                    if err:
+                        stats = f"{ratio:5.1%} {compact(amount):>8}  ERR"
+                        safe_add(screen, y, rx, stats, self.bad)
+                    elif wide:
+                        stats = f"{ratio:5.1%} {compact(amount):>8} {compact(calls):>6}c {source_rate:>7,.1f}/s"
+                        safe_add(screen, y, rx, stats)
+                    else:
+                        stats = f"{ratio:5.1%} {compact(amount):>8} {source_rate:>7,.1f}/s"
+                        safe_add(screen, y, rx, stats)
+                self.hits.append((y, 2, width - 5, 'source_focus', i + 1))
+
             trend_y = 9 + len(self.SOURCES) - 1
             values = [v['total'] for v in snap['timeline']]
-            unit = 'hourly today' if snap['days'] == 1 else 'daily'
-            safe_add(screen, trend_y, 2, f"{unit:12} {trend_spark(values, width - 31)}", self.accent)
+            unit = 'hourly today' if snap['days'] == 1 else f"daily {snap['days']}d"
+            spark_w = max(10, width - 38)
+            safe_add(screen, trend_y, 2, f"{unit:13}", self.dim)
+            safe_add(screen, trend_y, 16, trend_spark(values, spark_w), self.accent)
+            if values:
+                peak_v = compact(max(values, default=0))
+                safe_add(screen, trend_y, 17 + min(spark_w, len(values)), f"peak {peak_v}", self.dim)
             self.hits.append((trend_y, 2, width - 5, 'view', 2))
-            safe_add(screen, trend_y + 1, 2, 'ROUTES  /  Enter for details', self.dim)
-            self.table(screen, snap, trend_y + 2, height - 3)
+
+            safe_add(screen, trend_y + 1, 2, 'ROUTES', self.accent)
+            total_cnt, shown_lo, shown_hi = self.table(screen, snap, trend_y + 2, height - 3)
+            pos = f"{shown_lo + 1}-{shown_hi}/{total_cnt}" if total_cnt else "0"
+            safe_add(screen, trend_y + 1, 10, f"({pos} · sort {self.SORTS[self.sort]}{'▼' if self.sort_desc else '▲'} · Enter details)", self.dim)
         elif self.view == 1:
-            count = len(self.route_rows(snap))
-            self.button(screen, 8, 1, f's:sort {self.SORTS[self.sort]}', 'sort')
-            safe_add(screen, 8, 27, f"{count} routes | / search: {self.query or 'all'}", self.accent)
-            self.table(screen, snap, 9, height - 3)
+            rows = self.route_rows(snap)
+            arrow = "▼" if self.sort_desc else "▲"
+            sx = self.button(screen, 8, 1, f's:sort {self.SORTS[self.sort]} {arrow}', 'sort')
+            sx = self.button(screen, 8, sx, 'dir', 'sort_dir', attr=self.dim)
+            total_cnt, shown_lo, shown_hi = self.table(screen, snap, 9, height - 3)
+            pos = f"{shown_lo + 1}-{shown_hi}/{len(rows)}" if rows else "0"
+            safe_add(screen, 8, sx + 1, f"{pos} routes | / search: {self.query or 'all'}", self.accent)
         elif self.view == 2:
             self.trend(screen, snap)
         else:
             self.sources(screen, snap)
-        hints = ("Tab views | f source | 1-4 period | j/k select | Enter details",
-                 "j/k scroll | PgUp/PgDn | Enter details | / search | s sort | x reset",
-                 "Left/Right inspect | Home/End | m metric | click a bar",
-                 "Click a source to inspect its usage | r refresh")[self.view]
+
+        hints = (
+            "Tab views | f/F source | 0 all | 1-4 period | j/k select | Enter details",
+            "j/k scroll | PgUp/PgDn | Enter details | / search | s/S sort | x reset",
+            "Left/Right inspect | Home/End | m/M metric | click a bar or metric",
+            "j/k pick source | Enter focus | click source | r refresh",
+        )[self.view]
         safe_add(screen, height - 3, 1, '─' * (width - 3), self.dim)
         safe_add(screen, height - 2, 1, hints, self.accent)
+        if self.note and time.monotonic() >= self.note_until:
+            self.note = ""
         note = self.app.collection_error or self.note or 'Space pause | ? help | q quit | Completed records; streaming TPS unavailable'
-        safe_add(screen, height - 1, 1, note, self.dim)
+        safe_add(screen, height - 1, 1, note, self.bad if self.app.collection_error else self.dim)
         if self.searching:
-            safe_add(screen, height - 1, 1, (f"Search: {self.query}_   Enter apply / Esc cancel").ljust(width - 2), curses.A_REVERSE)
+            safe_add(screen, height - 1, 1, f"Search: {self.query}_   (Enter apply · Esc cancel)".ljust(width - 2), curses.A_REVERSE | curses.A_BOLD)
         if self.details and self.routes:
             route = self.routes[self.selected]
             volume = route['prompt'] + route['output']
             ratio = route['cache'] / route['prompt'] * 100 if route['prompt'] else 0
-            lines = [f"Source: {route['source']}", f"Model: {route['model']}", f"Backend / mode / task: {route['backend']}", '',
-                     f"Calls: {route['calls']:,}     Total tokens: {volume:,}",
-                     f"Prompt: {route['prompt']:,}     Output: {route['output']:,}",
-                     f"Cache: {route['cache']:,} ({ratio:.1f}% of prompt)",
-                     f"Mean tokens / call: {volume / route['calls']:,.0f}" if route['calls'] else 'Mean tokens / call: unavailable',
-                     f"Last recorded: {dt.datetime.fromtimestamp(route['latest']).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
-                     'Hermes values are session aggregates assigned to last activity.' if route['source'] == 'Hermes' else
-                     'Claude provider is not included in local usage records.' if route['source'] == 'Claude Code' else
-                     'DeepSeek Harness (dsh): one usage record per model call, from its session logs.' if route['source'] == 'DeepSeek' else
-                     'Antigravity: one usage record per model step, from conversation SQLite DBs.' if route['source'] == 'Antigravity' else
-                     'Model/provider come from Codex session context.',
-                     'Esc / Enter: close']
+            p_pct = round(route['prompt'] / volume * 100) if volume else 0
+            mix_w = 28
+            p_fill = round(route['prompt'] / volume * mix_w) if volume else 0
+            mix_bar = ('█' * p_fill) + ('░' * (mix_w - p_fill))
+            lines = [
+                f"Source: {route['source']}",
+                f"Model:  {route['model']}",
+                f"Backend / mode / task: {route['backend']}",
+                '',
+                f"Calls: {route['calls']:,}     Total tokens: {volume:,}",
+                f"Prompt: {route['prompt']:,}    Output: {route['output']:,}",
+                f"Mix [{mix_bar}] Prompt {p_pct}% / Out {100 - p_pct}%",
+                f"Cache: {route['cache']:,} ({ratio:.1f}% of prompt)",
+                f"Mean tokens / call: {volume / route['calls']:,.0f}" if route['calls'] else 'Mean tokens / call: unavailable',
+                f"Last recorded: {dt.datetime.fromtimestamp(route['latest']).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
+                'Hermes values are session aggregates assigned to last activity.' if route['source'] == 'Hermes' else
+                'Claude provider is not included in local usage records.' if route['source'] == 'Claude Code' else
+                'DeepSeek Harness (dsh): one usage record per model call, from session logs.' if route['source'] == 'DeepSeek' else
+                'Antigravity: one usage record per model step, from conversation SQLite DBs.' if route['source'] == 'Antigravity' else
+                'Model/provider come from Codex session context.',
+                'Esc / Enter: close',
+            ]
             self.modal(screen, 'ROUTE DETAILS', lines)
         if self.help:
             self.modal(screen, 'KEYBOARD + MOUSE', [
-                'Tab / Shift-Tab: switch view. Click tabs or period buttons.',
-                '1 / 2 / 3 / 4: today / 7d / 30d / 90d. f: cycle source.',
-                'Routes: j/k or arrows, PgUp/PgDn, Home/End; Enter details.',
-                '/: search model/backend. s: sort. x: clear source/search.',
-                'Trends: Left/Right inspect; m changes metric; click bars.',
-                'Space: freeze display (collection continues). r: refresh.',
-                'Esc: close overlay. ?: help. q: quit.', '',
-                '1d means today from local midnight, grouped hourly.',
-                'Hermes history uses session last-activity timestamps.',
-                'Rates count recorded usage; they are not streamed TPS.',
-                'Mouse support depends on your terminal.'])
+                'Tab / Shift-Tab: switch view (or click top tabs).',
+                '1-4: 1d / 7d / 30d / 90d window. 0 / f / F: All / cycle source.',
+                'Routes: j/k or wheel, PgUp/PgDn, Home/End; Enter for details.',
+                '/: live filter. s / S: sort field / reverse (or click column).',
+                'Trends: Left/Right or wheel scrub; m/M or click metric pills.',
+                'Sources: j/k pick source, Enter to focus Overview on it.',
+                'Space / p: pause display (collector keeps running). r: refresh.',
+                'x: clear filters. Esc: close modal/clear. ?: help. q: quit.',
+                '',
+                '1d starts at local midnight (hourly); Hermes uses last activity.',
+                'Rates count recorded completions, not live streaming TPS.',
+            ])
         screen.refresh()
 
     def trend(self, screen, snap):
         height, width = screen.getmaxyx()
         timeline = snap['timeline']
         metric = self.METRICS[self.metric]
-        self.button(screen, 8, 1, f'm:metric {metric}', 'metric')
-        safe_add(screen, 8, 27, 'HOURLY / TODAY' if snap['days'] == 1 else f"DAILY / {snap['days']} DAYS", self.accent)
+        x = 1
+        for i, m_name in enumerate(self.METRICS):
+            x = self.button(screen, 8, x, m_name, 'metric', i, i == self.metric)
+        period_lbl = 'HOURLY / TODAY' if snap['days'] == 1 else f"DAILY / {snap['days']} DAYS"
+        if x + len(period_lbl) + 2 < width:
+            safe_add(screen, 8, width - len(period_lbl) - 2, period_lbl, self.dim)
         if not timeline:
             return
         selected = len(timeline) - 1 if self.cursor is None else min(self.cursor, len(timeline) - 1)
@@ -1609,54 +1964,74 @@ class DashboardUI:
         start = max(0, min(selected - capacity // 2, len(timeline) - capacity))
         visible = timeline[start:start + capacity]
         peak = max((v[metric] for v in timeline), default=0)
+        window_sum = sum(v[metric] for v in timeline)
         bottom = height - 8
         chart_height = max(2, bottom - 10)
-        safe_add(screen, 10, 1, compact(peak), self.dim)
-        safe_add(screen, bottom, 5, '0', self.dim)
+        safe_add(screen, 10, 1, f"{compact(peak):>7}", self.dim)
+        if chart_height >= 5:
+            safe_add(screen, 10 + chart_height // 2, 1, f"{compact(peak // 2):>7}", self.dim)
+        safe_add(screen, bottom, 1, f"{'0':>7}", self.dim)
         for i, bucket in enumerate(visible):
-            x = 9 + i * 2
+            bx = 9 + i * 2
             index = start + i
             attr = self.good if index == selected else self.accent
             filled = bucket[metric] / peak * chart_height if peak else 0
             for row in range(chart_height):
                 glyph = '█' if filled >= row + 1 else '▄' if filled > row else '·' if row == 0 else ' '
                 y = bottom - row
-                safe_add(screen, y, x, glyph, attr)
-                self.hits.append((y, x, 2, 'cursor', index))
-            safe_add(screen, bottom + 1, x, '^' if index == selected else '─', attr | (curses.A_REVERSE if index == selected else 0))
-            self.hits.append((bottom + 1, x, 2, 'cursor', index))
+                safe_add(screen, y, bx, glyph, attr)
+                self.hits.append((y, bx, 2, 'cursor', index))
+            safe_add(screen, bottom + 1, bx, '▲' if index == selected else '─', attr | (curses.A_REVERSE if index == selected else 0))
+            self.hits.append((bottom + 1, bx, 2, 'cursor', index))
         safe_add(screen, bottom + 2, 9, visible[0]['label'], self.dim)
-        last_label = visible[-1]['label']
         if len(visible) > 3:
-            safe_add(screen, bottom + 2, 9 + (len(visible) - 1) * 2, last_label, self.dim)
+            end_x = min(width - len(visible[-1]['label']) - 2, 9 + (len(visible) - 1) * 2)
+            safe_add(screen, bottom + 2, end_x, visible[-1]['label'], self.dim)
         item = timeline[selected]
-        safe_add(screen, height - 5, 2, f"{item['label']} | {metric.upper()} {item[metric]:,} | calls {item['calls']:,}", self.accent)
-        safe_add(screen, height - 4, 2, f"Prompt {compact(item['prompt'])} / Out {compact(item['output'])} / Cache {compact(item['cache'])} | Hermes by last activity", self.dim)
+        share_pct = item[metric] / window_sum * 100 if window_sum else 0
+        safe_add(screen, height - 5, 2,
+                 f"{item['label']} | {metric.upper()} {item[metric]:,} ({share_pct:.1f}% of window) | calls {item['calls']:,}",
+                 self.good)
+        safe_add(screen, height - 4, 2,
+                 f"Prompt {compact(item['prompt'])} · Out {compact(item['output'])} · Cache {compact(item['cache'])} | Hermes by last activity",
+                 self.dim)
 
     def sources(self, screen, snap):
         height, width = screen.getmaxyx()
         step = 4 if height >= 31 else 3 if height >= 25 else 2
         units = {'Hermes': 'usage rows', 'DeepSeek': 'session files', 'Antigravity': 'session DBs'}
-        for i, name in enumerate(self.SOURCES[1:]):
+        window_total = snap['totals']['prompt'] + snap['totals']['output']
+        for i, name in enumerate(SOURCE_NAMES):
             y = 8 + i * step
             item = snap['source_status'][name]
-            state = item['error'] or 'Connected'
-            self.button(screen, y, 1, name, 'source_focus', i + 1)
-            safe_add(screen, y, 19, state, self.good if not item['error'] else self.accent)
+            state = item['error'] or '● Connected'
+            picked = i == self.source_cursor
+            src_attr = self.source_attr(name)
+            safe_add(screen, y, 1, ">" if picked else " ", self.accent)
+            self.button(screen, y, 2, name, 'source_focus', i + 1, active=picked, attr=src_attr)
+            safe_add(screen, y, 19, state, self.good if not item['error'] else self.bad)
+            metrics = snap['sources'].get(name, {})
+            src_tok = metrics.get('prompt', 0) + metrics.get('output', 0)
+            share_pct = src_tok / window_total * 100 if window_total else 0
             rate = snap['rate']['sources'].get(name, {})
-            summary = f"{item['files']:,} {units.get(name, 'log files')} | latest usage {short_age(item['latest'], snap['now'])}"
+            summary = f"{item['files']:,} {units.get(name, 'log files')} · {compact(src_tok)} ({share_pct:.1f}%) · latest {short_age(item['latest'], snap['now'])}"
             if step == 2:
-                summary += f" | {rate.get('prompt_per_sec', 0) + rate.get('output_per_sec', 0):,.1f} tok/s"
+                summary += f" · {rate.get('prompt_per_sec', 0) + rate.get('output_per_sec', 0):,.1f}/s"
             safe_add(screen, y + 1, 3, summary)
             if step >= 3:
-                safe_add(screen, y + 2, 3, f"Recorded prompt {rate.get('prompt_per_sec', 0):,.1f}/s | output {rate.get('output_per_sec', 0):,.1f}/s", self.dim)
+                safe_add(screen, y + 2, 3,
+                         f"Prompt {rate.get('prompt_per_sec', 0):,.1f}/s · Out {rate.get('output_per_sec', 0):,.1f}/s · Calls {metrics.get('calls', 0):,}",
+                         self.dim)
+            self.hits.append((y, 1, width - 3, 'source_pick', i))
         gw = snap['source_status']['gateway']
-        y = 8 + (len(self.SOURCES) - 1) * step
-        for text, attr in ((f"Hermes gateway: {gw['state']} | state {short_age(gw['latest'], snap['now'])} | agents {gw['agents']}", 0),
-                           ('Local usage only. Claude transport provider is not recorded.', self.dim),
-                           ('DeepSeek = DeepSeek Harness (dsh) sessions; failed attempts are not counted.', self.dim),
-                           ('Antigravity = local ~/.gemini/antigravity conversation databases.', self.dim),
-                           ('Hermes rate starts after an observed DB increment.', self.dim)):
+        y = 8 + len(SOURCE_NAMES) * step
+        for text, attr in (
+            (f"Hermes gateway: {gw['state']} | state {short_age(gw['latest'], snap['now'])} | active agents {gw['agents']}", self.warn if gw['state'] != 'running' else 0),
+            ('Local usage only. Claude transport provider is not recorded.', self.dim),
+            ('DeepSeek = DeepSeek Harness (dsh) sessions; failed attempts are not counted.', self.dim),
+            ('Antigravity = ~/.gemini/antigravity SQLite DBs (with f2=21 label + enum fallback).', self.dim),
+            ('Hermes = session_model_usage (or sessions table on older schemas).', self.dim),
+        ):
             if y < height - 3:
                 safe_add(screen, y, 2, text, attr)
             y += 1
@@ -1673,19 +2048,36 @@ def draw_dashboard(stdscr: Any, app: RouteWatch) -> None:
     try:
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN, -1)
-        curses.init_pair(2, curses.COLOR_GREEN, -1)
-        ui.accent = curses.color_pair(1) | curses.A_BOLD
-        ui.good = curses.color_pair(2) | curses.A_BOLD
+        pairs = (
+            (1, curses.COLOR_CYAN, "accent"),
+            (2, curses.COLOR_GREEN, "good"),
+            (3, curses.COLOR_YELLOW, "warn"),
+            (4, curses.COLOR_MAGENTA, "purple"),
+            (5, curses.COLOR_BLUE, "blue"),
+            (6, curses.COLOR_RED, "bad"),
+        )
+        for idx, color, attr_name in pairs:
+            if curses.COLOR_PAIRS > idx and curses.COLORS > color:
+                curses.init_pair(idx, color, -1)
+                setattr(ui, attr_name, curses.color_pair(idx) | curses.A_BOLD)
+        ui.source_colors = {
+            "Codex": ui.accent,
+            "Claude Code": ui.purple,
+            "DeepSeek": ui.good,
+            "Antigravity": ui.blue,
+            "Hermes": ui.warn,
+        }
         curses.mousemask(curses.ALL_MOUSE_EVENTS)
         curses.mouseinterval(150)
     except curses.error:
         pass
     snap = app.snapshot(source=ui.SOURCES[ui.source])
-    next_snapshot = 0
+    seen_scan = snap["last_scan"]
+    next_snapshot = 0.0
     while not app.stop_event.is_set():
-        if not ui.paused and (ui.needs_snapshot or time.monotonic() >= next_snapshot):
+        if not ui.paused and (ui.needs_snapshot or app.last_scan > seen_scan or time.monotonic() >= next_snapshot):
             snap = app.snapshot(source=ui.SOURCES[ui.source])
+            seen_scan = snap["last_scan"]
             ui.needs_snapshot = False
             next_snapshot = time.monotonic() + 1
         ui.render(stdscr, snap)
